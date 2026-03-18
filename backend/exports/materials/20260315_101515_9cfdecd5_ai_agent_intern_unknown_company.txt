@@ -1,0 +1,30 @@
+OfferPilot Material Export
+
+Thread ID: 9cfdecd5-be95-409e-b943-b2dde060e1db
+Job ID: d376dd3d-9b5d-4ccf-b32d-a5b45dda22be
+Title: AI Agent Intern
+Company: Unknown Company
+Resume Version: smoke_resume
+Status: approved
+
+=== Resume Bullets ===
+1. Developed an AI agent using Python, LangGraph, and RAG that improved retrieval accuracy by 25% through optimized query routing and context filtering in ChromaDB.
+2. Integrated MCP (Multi-agent Collaboration Protocol) to enable coordinated task execution among specialized agents, reducing workflow completion time by 30% in HITL approval scenarios.
+3. Built a FastAPI backend with Playwright automation to simulate user interactions, enabling end-to-end testing of agent-driven web workflows with 95% reliability across 50+ test cases.
+4. Designed a modular RAG pipeline with PostgreSQL for metadata management and ChromaDB for vector storage, supporting low-latency (<800ms) responses under concurrent load.
+5. Implemented basic observability via logging and error tracking, identifying 15+ edge cases in agent decision loops and improving system robustness through iterative refinement.
+
+=== Cover Letter ===
+Dear Hiring Team,
+
+As a 211 master’s candidate deeply engaged in AI agent development, I’ve built practical experience with your core stack: Python, LangGraph, RAG, MCP, and Playwright. In recent projects, I engineered a multi-agent system using LangGraph and MCP that cut workflow time by 30%, and enhanced RAG precision by 25% via adaptive retrieval strategies. My FastAPI services integrate Playwright for reliable browser automation, while PostgreSQL and ChromaDB ensure scalable data handling.
+
+Though my work is prototype-grade, I actively address reliability gaps—adding logging, error recovery, and load testing to approach production readiness. I’m eager to contribute to your AI Agent team and learn from real-world deployment challenges.
+
+Sincerely,
+[Your Name]
+
+=== BOSS Greeting Message ===
+Hi! AI Agent Intern applicant here—experienced in LangGraph, RAG & Playwright. Keen to contribute!
+
+Exported At: 2026-03-15T10:15:15

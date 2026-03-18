@@ -1,0 +1,28 @@
+OfferPilot Material Export
+
+Thread ID: dceecd8b-8da6-4995-91d3-86f25a49f579
+Job ID: 8bcf80d1-8a7b-4528-b5ab-fa3f98ee06c6
+Title: AI Agent Intern
+Company: Unknown Company
+Resume Version: resume_v1
+Status: approved
+
+=== Resume Bullets ===
+1. Developed an AI Agent workflow using Python, FastAPI, and LangGraph with Human-in-the-Loop (HITL) approval steps, reducing manual review time by 40% in internal testing.
+2. Built a RAG pipeline leveraging ChromaDB for vector storage and retrieval, achieving 85%+ answer accuracy on domain-specific queries through optimized chunking and reranking.
+3. Integrated MCP (Model Control Protocol) to standardize LLM interactions across microservices, improving system traceability and enabling consistent error handling.
+4. Automated web data collection and form submission using Playwright, increasing data ingestion reliability from 70% to 95% via retry logic and visual validation.
+5. Designed PostgreSQL-backed state persistence for multi-turn agent conversations, ensuring session continuity and auditability during workflow interruptions.
+
+=== Cover Letter ===
+Dear Hiring Team,
+
+As a 211 master’s candidate specializing in LLM applications and AI Agents, I’ve built end-to-end systems using Python, LangGraph, and RAG—exactly the stack your internship requires. My projects include HITL-enabled agent workflows, ChromaDB-powered retrieval, and Playwright automation, all designed with reliability in mind. While my experience is academic, I’ve prioritized production-like patterns: state persistence, error resilience, and measurable accuracy gains (e.g., 85%+ RAG precision). I’m eager to contribute to your AI Agent initiatives and learn enterprise-grade practices around monitoring and scalability. Thank you for considering my application.
+
+Sincerely,
+[Your Name]
+
+=== BOSS Greeting Message ===
+Hi! AI Agent Intern applicant here—built LangGraph/RAG agents w/ HITL & Playwright. Excited to contribute!
+
+Exported At: 2026-03-15T01:09:47

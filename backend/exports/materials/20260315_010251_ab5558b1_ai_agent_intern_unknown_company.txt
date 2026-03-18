@@ -1,0 +1,29 @@
+OfferPilot Material Export
+
+Thread ID: ab5558b1-83d0-4719-8ebe-f7c63f1daf9b
+Job ID: 1725366c-367a-4071-bf63-dd04a4a49faa
+Title: AI Agent Intern
+Company: Unknown Company
+Resume Version: resume_v1
+Status: approved
+
+=== Resume Bullets ===
+1. Developed an AI Agent workflow using Python, LangGraph, and FastAPI that integrated Human-in-the-Loop (HITL) approval steps, reducing manual review time by 40% while ensuring reliable task handoff between automated and human stages.
+2. Built a RAG pipeline with ChromaDB for vector storage and retrieval, achieving 85%+ answer accuracy on domain-specific queries through optimized chunking and metadata filtering.
+3. Implemented MCP (Multi-agent Collaboration Protocol) to coordinate specialized agents, improving task completion rate by 30% in complex, multi-step scenarios.
+4. Automated web data extraction and form submission using Playwright, enabling seamless integration of external data sources into the agent system with 95% success rate across 10+ target sites.
+5. Designed PostgreSQL-backed logging and state persistence for agent workflows, enhancing reproducibility and enabling basic monitoring of execution reliability.
+
+=== Cover Letter ===
+Dear Hiring Team,
+
+As a 211 master’s candidate specializing in LLM applications and AI Agents, I’ve built end-to-end agent systems using Python, LangGraph, and RAG—exactly the stack you’re seeking. My projects integrate HITL approvals, MCP-based coordination, and Playwright automation, all backed by FastAPI and vector databases like ChromaDB.
+
+While my work demonstrates strong prototyping ability, I’m eager to learn how to scale these systems with production-grade reliability and monitoring—addressing the gap I recognize in my current experience. I’m excited about contributing to your AI Agent initiatives and growing as an engineer in a real-world deployment environment.
+
+Thank you for considering my application.
+
+=== BOSS Greeting Message ===
+Hi! AI Agent Intern applicant here—built LangGraph + RAG + Playwright systems. Keen to contribute!
+
+Exported At: 2026-03-15T01:02:51

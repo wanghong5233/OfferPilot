@@ -1,0 +1,92 @@
+name: offerpilot
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: offerpilot-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: offerpilot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: offerpilot
+    ports:
+      - "15433:5432"
+    volumes:
+      - offerpilot_pg_data:/var/lib/postgresql/data
+      - ../backend/sql/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d offerpilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    profiles: ["fullstack"]
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: offerpilot-backend
+    restart: unless-stopped
+    environment:
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      QWEN_API_KEY: ${QWEN_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENAI_COMPAT_BASE_URL: ${OPENAI_COMPAT_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      MODEL_PRIMARY: ${MODEL_PRIMARY:-qwen3-max}
+      MODEL_FALLBACK: ${MODEL_FALLBACK:-qwen-plus}
+      DATABASE_URL: postgresql://postgres:offerpilot@postgres:5432/offerpilot
+      LANGGRAPH_CHECKPOINT_DATABASE_URL: postgresql://postgres:offerpilot@postgres:5432/offerpilot
+      CORS_ORIGINS: http://127.0.0.1:3000,http://localhost:3000
+      CHROMA_DIR: /data/chroma_db
+      CHROMA_JD_HISTORY_COLLECTION: ${CHROMA_JD_HISTORY_COLLECTION:-jd_history}
+      CHROMA_RESUME_COLLECTION: ${CHROMA_RESUME_COLLECTION:-resume_chunks}
+      LOCAL_EMBED_DIM: ${LOCAL_EMBED_DIM:-256}
+      JD_HISTORY_MIN_SIMILARITY: ${JD_HISTORY_MIN_SIMILARITY:-0.35}
+      MATERIAL_MIN_MATCH_SCORE: ${MATERIAL_MIN_MATCH_SCORE:-60}
+      MATERIAL_EXPORT_DIR: /data/exports/materials
+      FORM_AUTOFILL_TIMEOUT_MS: ${FORM_AUTOFILL_TIMEOUT_MS:-20000}
+      BOSS_BROWSER_PROFILE_DIR: /data/.playwright/boss
+      BOSS_SCREENSHOT_DIR: /data/exports/screenshots
+      BOSS_HEADLESS: ${BOSS_HEADLESS:-true}
+      BOSS_ENABLE_STEALTH: ${BOSS_ENABLE_STEALTH:-true}
+      BOSS_ACTION_DELAY_MIN_MS: ${BOSS_ACTION_DELAY_MIN_MS:-3000}
+      BOSS_ACTION_DELAY_MAX_MS: ${BOSS_ACTION_DELAY_MAX_MS:-5000}
+      BOSS_FETCH_DETAIL: ${BOSS_FETCH_DETAIL:-false}
+      IMAP_HOST: ${IMAP_HOST:-}
+      IMAP_PORT: ${IMAP_PORT:-993}
+      IMAP_USER: ${IMAP_USER:-}
+      IMAP_PASSWORD: ${IMAP_PASSWORD:-}
+      EMAIL_HEARTBEAT_ENABLED: ${EMAIL_HEARTBEAT_ENABLED:-false}
+      EMAIL_HEARTBEAT_INTERVAL_SEC: ${EMAIL_HEARTBEAT_INTERVAL_SEC:-1800}
+      EMAIL_HEARTBEAT_MAX_ITEMS: ${EMAIL_HEARTBEAT_MAX_ITEMS:-10}
+      EMAIL_HEARTBEAT_MARK_SEEN: ${EMAIL_HEARTBEAT_MARK_SEEN:-false}
+      EMAIL_HEARTBEAT_NOTIFY_ON_UPDATES: ${EMAIL_HEARTBEAT_NOTIFY_ON_UPDATES:-true}
+      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
+      NOTIFY_MODE: ${NOTIFY_MODE:-feishu_card}
+      NOTIFY_TIMEOUT_SEC: ${NOTIFY_TIMEOUT_SEC:-8}
+    volumes:
+      - offerpilot_backend_data:/data
+    ports:
+      - "8010:8010"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    profiles: ["fullstack"]
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: http://127.0.0.1:8010
+    container_name: offerpilot-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  offerpilot_pg_data:
+  offerpilot_backend_data:

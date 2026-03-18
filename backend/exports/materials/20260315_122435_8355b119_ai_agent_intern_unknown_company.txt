@@ -1,0 +1,27 @@
+OfferPilot Material Export
+
+Thread ID: 8355b119-5831-47b6-bdde-7f9eeb2bdac8
+Job ID: c8e29076-c29c-4fcb-b854-864d911b5b65
+Title: AI Agent Intern
+Company: Unknown Company
+Resume Version: smoke_resume
+Status: approved
+
+=== Resume Bullets ===
+1. Developed an AI agent using Python, LangGraph, and FastAPI to orchestrate multi-step RAG workflows, improving retrieval accuracy by 25% through dynamic query refinement and context routing.
+2. Integrated ChromaDB with a custom RAG pipeline to enable low-latency semantic search over 10K+ technical documents, reducing hallucination rates by grounding responses in verified sources.
+3. Implemented human-in-the-loop (HITL) approval nodes in LangGraph workflows, allowing safe escalation for ambiguous queries and increasing system reliability in edge-case handling.
+4. Automated end-to-end browser testing and data extraction using Playwright, enabling real-time validation of agent outputs against live web sources with 95% task success rate.
+5. Designed modular agent architecture supporting MCP (Model Context Protocol) standards, facilitating seamless integration with external tools and future production monitoring hooks.
+
+=== Cover Letter ===
+Dear Hiring Team,
+
+As a 211 master’s candidate deeply engaged in building reliable LLM applications, I’m excited to apply for the AI Agent Intern role. My hands-on experience aligns closely with your stack: I’ve built LangGraph-powered agents with RAG over ChromaDB, implemented HITL safeguards for robustness, and used Playwright for real-world validation. While my projects demonstrate strong prototyping ability, I’m eager to learn how to harden these systems for production—particularly around monitoring and enterprise reliability. I’m confident I can contribute from day one while growing under your mentorship.
+
+Thank you for considering my application.
+
+=== BOSS Greeting Message ===
+Hi! AI Agent intern here—built LangGraph+RAG agents w/ Playwright & MCP. Keen to contribute!
+
+Exported At: 2026-03-15T12:24:35

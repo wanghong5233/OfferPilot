@@ -1,0 +1,28 @@
+OfferPilot Material Export
+
+Thread ID: 90409e49-d393-41e8-9c86-1ec6748cb0c5
+Job ID: 3f17a82c-cb66-4439-ac6d-6926cb9a2789
+Title: AI Agent Intern
+Company: Unknown Company
+Resume Version: smoke_resume
+Status: approved
+
+=== Resume Bullets ===
+1. Built an AI agent using Python, LangGraph, and RAG that improved retrieval accuracy by 25% via optimized query routing and ChromaDB indexing.
+2. Integrated MCP (Multi-Consensus Protocol) into LLM workflows to enhance output reliability, reducing hallucination rates by ~30% in user testing.
+3. Automated browser-based data collection and form submission using Playwright, cutting manual effort by 15+ hours/week while maintaining 98% task success rate.
+4. Developed a FastAPI backend with PostgreSQL for agent state persistence, enabling seamless human-in-the-loop (HITL) approvals and audit trails.
+5. Designed modular agent workflows in LangGraph supporting dynamic tool calling and fallback mechanisms, improving system robustness under edge cases.
+
+=== Cover Letter ===
+Dear Hiring Team,
+
+As a 211 master’s candidate with hands-on experience building AI agents using Python, LangGraph, RAG, and MCP, I’m excited to apply for the AI Agent Intern role. I’ve developed end-to-end LLM applications featuring ChromaDB-powered retrieval, Playwright automation, and FastAPI backends—with measurable gains in accuracy and efficiency. While my projects demonstrate strong prototyping skills, I’m eager to learn how to scale such systems with production-grade monitoring and reliability. I’d welcome the chance to contribute to your team while growing as an engineer.
+
+Sincerely,
+[Your Name]
+
+=== BOSS Greeting Message ===
+Hi! AI Agent intern here—built LangGraph+RAG apps w/ Playwright & MCP. Keen to contribute!
+
+Exported At: 2026-03-15T11:09:04
