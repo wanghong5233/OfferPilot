@@ -2081,7 +2081,7 @@ export default function Home() {
                   {analysis.skills.map((skill) => (
                     <span key={skill} className="rounded-full bg-zinc-100 px-2 py-1 text-xs">{skill}</span>
                   ))}
-                </div>
+        </div>
               </div>
             </div>
             <div className="space-y-3">

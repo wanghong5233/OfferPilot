@@ -112,6 +112,7 @@ metadata: {"openclaw": {"always": true}}
 - 岗位核心工作是传统算法（推荐/搜索/CV/NLP基础研究），而非LLM应用
 - 岗位核心工作是测试/QA/运维，而非开发
 - 岗位要求博士学历（候选人硕士）
+- 岗位日薪明确低于200元/天
 
 ### Accept Rules（应该接受的情况）
 
@@ -135,3 +136,4 @@ metadata: {"openclaw": {"always": true}}
 | batch_size | 3 | 每轮打招呼数量 |
 | daily_limit | 50 | 每日打招呼上限 |
 | search_multiplier | 5 | 搜索量 = batch_size × 此值 |
+| min_daily_salary | 200 | 日薪下限（元/天），低于此值直接拒绝 |

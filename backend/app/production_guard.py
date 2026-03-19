@@ -20,11 +20,39 @@ import subprocess
 import threading
 import time
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 from app.tz import now_beijing
 
 logger = logging.getLogger(__name__)
+
+_GUARD_LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+_GUARD_LOG_MAX_BYTES = 20 * 1024 * 1024
+_GUARD_LOG_BACKUP_COUNT = 5
+
+
+def _guard_file_logger() -> logging.Logger:
+    """独立的文件日志 — guard.log，方便调试。"""
+    fl = logging.getLogger("guard_file")
+    if fl.handlers:
+        return fl
+    _GUARD_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    fh = RotatingFileHandler(
+        str(_GUARD_LOG_DIR / "guard.log"),
+        maxBytes=_GUARD_LOG_MAX_BYTES,
+        backupCount=_GUARD_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    fl.addHandler(fh)
+    fl.setLevel(logging.DEBUG)
+    fl.propagate = False
+    return fl
+
+
+glog = _guard_file_logger()
 
 
 def _now_local() -> datetime:
@@ -101,6 +129,7 @@ class ProductionGuard:
         self._thread: threading.Thread | None = None
         self._running = False
         self._lock = threading.Lock()
+        self._tick_seq = 0
 
         self._last_greet: float = 0
         self._last_chat: float = 0
@@ -137,6 +166,19 @@ class ProductionGuard:
                 GUARD_GREET_ENABLED, GUARD_CHAT_ENABLED,
                 ACTIVE_START_HOUR, ACTIVE_END_HOUR,
             )
+            glog.info(
+                "Guard started: greet_enabled=%s chat_enabled=%s active=%02d-%02d "
+                "weekend_active=%02d-%02d greet_interval_peak=%ss chat_interval_peak=%ss chat_interval_offpeak=%ss",
+                GUARD_GREET_ENABLED,
+                GUARD_CHAT_ENABLED,
+                ACTIVE_START_HOUR,
+                ACTIVE_END_HOUR,
+                WEEKEND_ACTIVE_START,
+                WEEKEND_ACTIVE_END,
+                GREET_INTERVAL_PEAK,
+                CHAT_INTERVAL_PEAK,
+                CHAT_INTERVAL_OFFPEAK,
+            )
             return True
 
     def stop(self, *, timeout: float = 5.0) -> None:
@@ -156,16 +198,19 @@ class ProductionGuard:
 
     def _main_loop(self) -> None:
         time.sleep(10)
+        glog.info("Guard main loop started")
         while not self._stop_event.is_set():
             try:
                 self._tick()
             except Exception as exc:
                 self._stats["errors"] += 1
+                glog.exception("ProductionGuard tick error: %s", exc)
                 logger.exception("ProductionGuard tick error: %s", exc)
             self._stop_event.wait(timeout=30)
 
     def _tick(self) -> None:
         now = time.monotonic()
+        self._tick_seq += 1
 
         if not _is_active_hour():
             self._handle_sleep(now)
@@ -180,6 +225,18 @@ class ProductionGuard:
 
         peak = _is_peak_hour()
         h = _current_hour()
+        if self._tick_seq % 10 == 0:
+            glog.debug(
+                "tick#%d now=%02d:%02d active=%s peak=%s stats(greet=%d chat=%d errors=%d)",
+                self._tick_seq,
+                _current_hour(),
+                _now_local().minute,
+                _is_active_hour(),
+                peak,
+                self._stats.get("greet_runs", 0),
+                self._stats.get("chat_runs", 0),
+                self._stats.get("errors", 0),
+            )
 
         if GUARD_GREET_ENABLED and peak and not _is_weekend():
             if now - self._last_greet >= GREET_INTERVAL_PEAK:
@@ -201,9 +258,12 @@ class ProductionGuard:
             self._sleep_logged = False
 
         if not self._sleep_logged:
+            active_start = WEEKEND_ACTIVE_START if _is_weekend() else ACTIVE_START_HOUR
+            active_end = WEEKEND_ACTIVE_END if _is_weekend() else ACTIVE_END_HOUR
             logger.info(
                 "ProductionGuard 进入休眠（当前 %02d:%02d，活跃时段 %d:00-%d:00）",
                 _current_hour(), _now_local().minute,
+                active_start, active_end,
             )
             self._sleep_logged = True
 
@@ -237,6 +297,7 @@ class ProductionGuard:
             from .boss_scan import greet_matching_jobs
             from .storage import get_user_profile
 
+            run_id = f"greet-{now_beijing().strftime('%Y%m%d-%H%M%S')}"
             profile = get_user_profile("default")
             job_type = "all"
             keyword = ""
@@ -253,14 +314,28 @@ class ProductionGuard:
             if job_type == "intern" and "实习" not in keyword:
                 keyword = f"{keyword} 实习"
 
+            glog.info("=== GREET START === run_id=%s keyword=%r job_type=%s", run_id, keyword, job_type)
             logger.info("Guard greet: keyword=%r job_type=%s", keyword, job_type)
 
             result = greet_matching_jobs(
                 keyword=keyword,
                 batch_size=3,
                 job_type=job_type,
+                run_id=run_id,
             )
             self._stats["greet_runs"] += 1
+            glog.info(
+                "=== GREET END === run_id=%s greeted=%s failed=%s llm_rejected=%s detail_fail=%s daily=%s/%s reason=%s rounds=%s",
+                run_id,
+                result.get("greeted", 0), result.get("failed", 0),
+                result.get("llm_rejected", 0), result.get("detail_fail", 0),
+                result.get("daily_count", "?"), result.get("daily_limit", "?"),
+                result.get("reason", "-"),
+                result.get("rounds", "-"),
+            )
+            details = result.get("matched_details") or []
+            for d in details:
+                glog.info("  %s | %s | success=%s | %s", d.get("title"), d.get("company"), d.get("success"), d.get("detail", "")[:120])
             logger.info(
                 "Guard greet: greeted=%s failed=%s daily=%s/%s",
                 result.get("greeted", 0), result.get("failed", 0),
@@ -268,27 +343,36 @@ class ProductionGuard:
             )
         except Exception as exc:
             self._stats["errors"] += 1
+            glog.exception("=== GREET ERROR === %s", exc)
             logger.warning("Guard greet error: %s", str(exc)[:200])
 
     # ── 聊天巡检 ──────────────────────────────────
 
     def _do_chat(self) -> None:
         try:
-            from .boss_chat_workflow import boss_chat_copilot
+            from .boss_chat_workflow import run_boss_chat_copilot_workflow
 
-            resp = boss_chat_copilot(
+            run_id = f"chat-{now_beijing().strftime('%Y%m%d-%H%M%S')}"
+            glog.info("=== CHAT START === run_id=%s unread_only=true max_conversations=10", run_id)
+            resp = run_boss_chat_copilot_workflow(
                 max_conversations=10,
                 unread_only=True,
                 profile_id="default",
+                notify_on_escalate=True,
                 auto_execute=True,
             )
             self._stats["chat_runs"] += 1
+            glog.info(
+                "=== CHAT END === run_id=%s total=%d new=%d processed=%d",
+                run_id, resp.total_conversations, resp.new_count, resp.processed_count,
+            )
             logger.info(
                 "Guard chat: total=%d new=%d processed=%d",
                 resp.total_conversations, resp.new_count, resp.processed_count,
             )
         except Exception as exc:
             self._stats["errors"] += 1
+            glog.exception("=== CHAT ERROR === %s", exc)
             logger.warning("Guard chat error: %s", str(exc)[:200])
 
     # ── 资源清理 ──────────────────────────────────
@@ -296,8 +380,10 @@ class ProductionGuard:
     def _do_cleanup(self) -> None:
         closed_tabs = self._cleanup_tabs()
         killed_procs = self._cleanup_orphan_chrome()
+        glog.debug("cleanup result: closed_tabs=%d killed_orphans=%d", closed_tabs, killed_procs)
         if closed_tabs > 0 or killed_procs > 0:
             self._stats["cleanups"] += 1
+            glog.info("cleanup action: closed_tabs=%d killed_orphans=%d", closed_tabs, killed_procs)
 
     def _cleanup_tabs(self) -> int:
         try:
@@ -307,7 +393,36 @@ class ProductionGuard:
             return 0
 
     def _cleanup_orphan_chrome(self) -> int:
-        """清理不属于当前会话的孤儿 Chrome/Chromium 进程（仅 Linux/WSL）。"""
+        """清理不属于当前会话的孤儿 Chrome/Chromium 进程（仅 Linux/WSL）。
+
+        保守策略：如果无法确认当前浏览器 PID，则跳过清理，避免误杀。
+        """
+        def _collect_descendants(root_pid: int) -> set[int]:
+            """收集 root_pid 的全部子孙进程，避免误杀当前浏览器会话组件。"""
+            protected: set[int] = {root_pid}
+            stack: list[int] = [root_pid]
+            while stack:
+                parent = stack.pop()
+                try:
+                    child_res = subprocess.run(
+                        ["pgrep", "-P", str(parent)],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if child_res.returncode != 0:
+                        continue
+                    for line in child_res.stdout.strip().split("\n"):
+                        s = line.strip()
+                        if not s:
+                            continue
+                        child_pid = int(s)
+                        if child_pid in protected:
+                            continue
+                        protected.add(child_pid)
+                        stack.append(child_pid)
+                except Exception:
+                    continue
+            return protected
+
         killed = 0
         try:
             result = subprocess.run(
@@ -319,15 +434,21 @@ class ProductionGuard:
 
             from .boss_scan import _browser_context
             known_pids: set[int] = set()
+            protected_pids: set[int] = set()
             if _browser_context is not None:
                 try:
-                    browser = _browser_context.browser
-                    if browser and hasattr(browser, "process"):
-                        proc = browser.process
+                    browser = getattr(_browser_context, "browser", None)
+                    if browser:
+                        proc = getattr(browser, "process", None)
                         if proc:
                             known_pids.add(proc.pid)
+                            protected_pids |= _collect_descendants(proc.pid)
                 except Exception:
                     pass
+
+            if not known_pids:
+                logger.info("无法获取当前浏览器 PID，跳过孤儿清理以避免误杀")
+                return 0
 
             for line in result.stdout.strip().split("\n"):
                 pid_str = line.strip()
@@ -335,7 +456,7 @@ class ProductionGuard:
                     continue
                 try:
                     pid = int(pid_str)
-                    if pid in known_pids:
+                    if pid in protected_pids or pid in known_pids:
                         continue
                     os.kill(pid, signal.SIGTERM)
                     killed += 1

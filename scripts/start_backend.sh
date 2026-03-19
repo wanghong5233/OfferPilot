@@ -12,6 +12,11 @@ done < ../.env
 
 echo "=== PRODUCTION_GUARD_ENABLED=$PRODUCTION_GUARD_ENABLED ==="
 echo "=== GUARD_TIMEZONE=$GUARD_TIMEZONE ==="
-echo "=== 启动后端 (uvicorn --reload) ==="
 
-exec uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload
+if [ "$PRODUCTION_GUARD_ENABLED" = "true" ]; then
+    echo "=== 启动后端 (生产模式，无热重载) ==="
+    exec uvicorn app.main:app --host 0.0.0.0 --port 8010
+else
+    echo "=== 启动后端 (开发模式，--reload) ==="
+    exec uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload
+fi

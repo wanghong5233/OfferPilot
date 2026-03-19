@@ -4,7 +4,10 @@ import logging
 import os
 import random
 import re
+import signal
+import subprocess
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -18,6 +21,35 @@ from .schemas import BossChatConversationItem, BossScanItem
 logger = logging.getLogger(__name__)
 
 _LOGIN_URL_MARKERS = ["/web/user/", "/login", "passport.zhipin.com"]
+
+
+def _ensure_guard_debug_logger() -> logging.Logger:
+    """确保 guard_file logger 始终可用（即使手动触发 API 也会落盘）。"""
+    lg = logging.getLogger("guard_file")
+    if lg.handlers:
+        return lg
+    try:
+        log_dir = _project_root() / "backend" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        fh = RotatingFileHandler(
+            str(log_dir / "guard.log"),
+            maxBytes=20 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        fh.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        lg.addHandler(fh)
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = False
+    except Exception:
+        # logger 初始化失败不影响主流程
+        pass
+    return lg
 
 
 def _check_login_required(page: Any) -> bool:
@@ -117,6 +149,57 @@ def _aggressive_antibot() -> bool:
     return os.getenv("BOSS_AGGRESSIVE_ANTIBOT", "false").strip().lower() in {"1", "true", "yes"}
 
 
+def _project_root() -> Path:
+    """项目根目录（OfferPilot）。"""
+    return Path(__file__).resolve().parents[2]
+
+
+def _clear_profile_lock_files(profile_dir: Path) -> None:
+    """清理 Chrome profile 的残留锁文件（崩溃恢复场景）。"""
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (profile_dir / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _kill_profile_chrome_processes(profile_dir: Path) -> int:
+    """兜底清理占用同一 profile 的僵尸 Chrome 进程。"""
+    killed = 0
+    profile = str(profile_dir)
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid,args"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return 0
+        for line in result.stdout.splitlines():
+            if "chrome" not in line or "--user-data-dir=" not in line:
+                continue
+            if profile not in line:
+                continue
+            parts = line.strip().split(maxsplit=1)
+            if not parts:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (ProcessLookupError, PermissionError):
+                continue
+    except Exception:
+        return killed
+    if killed > 0:
+        logger.warning("Killed %d stale chrome process(es) for profile=%s", killed, profile)
+    return killed
+
+
 # ---------------------------------------------------------------------------
 # Browser session pool — singleton that stays alive across API calls
 # ---------------------------------------------------------------------------
@@ -143,10 +226,28 @@ def _get_browser_context() -> Any:
     try:
         if _browser_context is not None:
             try:
-                _ = _browser_context.pages
+                pages = _browser_context.pages
+                created_probe = False
+                probe_page = pages[0] if pages else _browser_context.new_page()
+                if not pages:
+                    created_probe = True
+                probe_page.evaluate("() => 1")
+                if created_probe:
+                    probe_page.close()
                 return _browser_context
             except Exception:
+                logger.warning("Browser context dead, full rebuild")
+                try:
+                    _browser_context.close()
+                except Exception:
+                    pass
                 _browser_context = None
+                try:
+                    if _browser_pw is not None:
+                        _browser_pw.stop()
+                except Exception:
+                    pass
+                _browser_pw = None
 
         from patchright.sync_api import sync_playwright
 
@@ -156,14 +257,41 @@ def _get_browser_context() -> Any:
         headless = _headless()
         profile_dir = _profile_dir()
         profile_dir.mkdir(parents=True, exist_ok=True)
-        _browser_context = _browser_pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            channel="chrome",
-            headless=headless,
-            no_viewport=True,
-            ignore_default_args=_ANTI_DETECT_IGNORE,
-            args=["--no-sandbox", *_ANTI_DETECT_ARGS],
-        )
+        _clear_profile_lock_files(profile_dir)
+        try:
+            _browser_context = _browser_pw.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel="chrome",
+                headless=headless,
+                no_viewport=True,
+                ignore_default_args=_ANTI_DETECT_IGNORE,
+                args=["--no-sandbox", *_ANTI_DETECT_ARGS],
+            )
+        except Exception as exc:
+            err = str(exc).lower()
+            recoverable = (
+                "opening in existing browser session" in err
+                or "target page, context or browser has been closed" in err
+            )
+            if not recoverable:
+                raise
+            logger.warning("Browser launch failed, try hard recovery: %s", str(exc)[:200])
+            _kill_profile_chrome_processes(profile_dir)
+            _clear_profile_lock_files(profile_dir)
+            try:
+                if _browser_pw is not None:
+                    _browser_pw.stop()
+            except Exception:
+                pass
+            _browser_pw = sync_playwright().start()
+            _browser_context = _browser_pw.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                channel="chrome",
+                headless=headless,
+                no_viewport=True,
+                ignore_default_args=_ANTI_DETECT_IGNORE,
+                args=["--no-sandbox", *_ANTI_DETECT_ARGS],
+            )
         logger.info("Browser session created (headless=%s, profile=%s)", headless, profile_dir)
         return _browser_context
     finally:
@@ -287,10 +415,21 @@ def boss_login_via_pool(timeout: int = 300) -> dict:
 
 def _get_page(context: Any) -> Any:
     """Get a usable page from the context, reusing existing or creating new."""
-    pages = context.pages
-    if pages:
-        page = pages[0]
-    else:
+    page = None
+    try:
+        pages = context.pages
+    except Exception:
+        pages = []
+
+    for p in pages:
+        try:
+            if not p.is_closed():
+                page = p
+                break
+        except Exception:
+            continue
+
+    if page is None:
         page = context.new_page()
     page.set_default_timeout(20000)
     return page
@@ -355,8 +494,13 @@ def _fetch_detail_enabled() -> bool:
 def _profile_dir() -> Path:
     configured = os.getenv("BOSS_BROWSER_PROFILE_DIR", "").strip()
     if configured:
-        return Path(configured).expanduser().resolve()
-    return (Path(__file__).resolve().parents[1] / ".playwright" / "boss").resolve()
+        raw = Path(configured).expanduser()
+        if raw.is_absolute():
+            return raw.resolve()
+        # 统一与 scripts/boss-login.sh 的相对路径基准（项目根目录）一致，
+        # 避免 backend/backend/.playwright 这种路径漂移导致会话不一致。
+        return (_project_root() / raw).resolve()
+    return (_project_root() / "backend" / ".playwright" / "boss").resolve()
 
 
 def _screenshot_dir() -> Path:
@@ -724,6 +868,218 @@ def _extract_detail_text(detail_page: Any) -> str:
         pass
 
     return ""
+
+
+_WORKING_DAYS_PER_MONTH = (52 * 5) / 12  # 按每周 5 天折算（月工作日约 21.67）
+
+
+def _salary_unit_multiplier(unit: str | None) -> float:
+    u = (unit or "").strip()
+    if not u:
+        return 1.0
+    if u in {"k", "K", "千"}:
+        return 1000.0
+    if u in {"w", "W", "万"}:
+        return 10000.0
+    return 1.0
+
+
+def _to_yuan(value: str, unit: str | None, default_unit: str = "") -> float:
+    unit_text = (unit or "").strip() or default_unit
+    return float(value) * _salary_unit_multiplier(unit_text)
+
+
+def _format_money(value: float | None) -> str:
+    if value is None:
+        return "?"
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.1f}"
+
+
+def _parse_salary_to_daily_range(text: str) -> tuple[float, float, str] | None:
+    """将薪资文本解析为日薪区间(min_daily, max_daily, basis)。
+
+    basis:
+      - "daily": 原始就是日薪
+      - "monthly": 由月薪折算
+    """
+    s = (
+        (text or "")
+        .replace("／", "/")
+        .replace("～", "-")
+        .replace("~", "-")
+        .replace("—", "-")
+        .replace("－", "-")
+        .replace("至", "-")
+        .replace("到", "-")
+        .strip()
+    )
+    if not s:
+        return None
+
+    unit_token = r"[kKwW千万元]"
+    num_token = r"\d+(?:\.\d+)?"
+
+    # 1) 日薪区间：160-250元/天
+    m = re.search(
+        rf"(?P<low>{num_token})\s*(?P<ul>{unit_token})?\s*-\s*"
+        rf"(?P<high>{num_token})\s*(?P<uh>{unit_token})?\s*元?\s*/\s*(?:天|日)",
+        s,
+    )
+    if m:
+        ul = m.group("ul") or m.group("uh") or ""
+        uh = m.group("uh") or m.group("ul") or ""
+        low = _to_yuan(m.group("low"), ul)
+        high = _to_yuan(m.group("high"), uh)
+        return min(low, high), max(low, high), "daily"
+
+    # 2) 日薪单值：220元/天
+    m = re.search(
+        rf"(?P<v>{num_token})\s*(?P<u>{unit_token})?\s*元?\s*/\s*(?:天|日)",
+        s,
+    )
+    if m:
+        v = _to_yuan(m.group("v"), m.group("u"))
+        return v, v, "daily"
+
+    # 3) 月薪区间（显式 /月）：3.5-4.5k/月、3500-4500元/月
+    m = re.search(
+        rf"(?P<low>{num_token})\s*(?P<ul>{unit_token})?\s*-\s*"
+        rf"(?P<high>{num_token})\s*(?P<uh>{unit_token})?\s*(?:元)?\s*/\s*月",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        ul = m.group("ul") or m.group("uh") or ""
+        uh = m.group("uh") or m.group("ul") or ""
+        low_month = _to_yuan(m.group("low"), ul)
+        high_month = _to_yuan(m.group("high"), uh)
+        low_daily = min(low_month, high_month) / _WORKING_DAYS_PER_MONTH
+        high_daily = max(low_month, high_month) / _WORKING_DAYS_PER_MONTH
+        return low_daily, high_daily, "monthly"
+
+    # 4) 月薪单值（显式 /月）：3500/月、3.5k/月
+    m = re.search(
+        rf"(?P<v>{num_token})\s*(?P<u>{unit_token})?\s*(?:元)?\s*/\s*月",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        month = _to_yuan(m.group("v"), m.group("u"))
+        daily = month / _WORKING_DAYS_PER_MONTH
+        return daily, daily, "monthly"
+
+    # 5) 月薪区间（隐式 K/万）：3.5-4.5K、1.2-1.8万
+    m = re.search(
+        rf"(?P<low>{num_token})\s*(?P<ul>{unit_token})?\s*-\s*"
+        rf"(?P<high>{num_token})\s*(?P<uh>{unit_token})",
+        s,
+    )
+    if m:
+        ul = m.group("ul") or m.group("uh")
+        uh = m.group("uh") or m.group("ul")
+        low_month = _to_yuan(m.group("low"), ul)
+        high_month = _to_yuan(m.group("high"), uh)
+        low_daily = min(low_month, high_month) / _WORKING_DAYS_PER_MONTH
+        high_daily = max(low_month, high_month) / _WORKING_DAYS_PER_MONTH
+        return low_daily, high_daily, "monthly"
+
+    # 6) 月薪单值（隐式 K/万）：3.5K、1.2万
+    m = re.search(rf"(?P<v>{num_token})\s*(?P<u>{unit_token})", s)
+    if m and m.group("u"):
+        month = _to_yuan(m.group("v"), m.group("u"))
+        daily = month / _WORKING_DAYS_PER_MONTH
+        return daily, daily, "monthly"
+
+    return None
+
+
+def _extract_detail_salary_info(detail_page: Any) -> dict[str, Any] | None:
+    """从详情页提取薪资并折算为日薪区间。"""
+    selectors = [
+        ".salary",
+        ".job-banner .salary",
+        ".info-primary .salary",
+        "[class*='salary']",
+        ".job-detail .salary",
+    ]
+    candidates: list[tuple[str, str]] = []
+    for sel in selectors:
+        try:
+            loc = detail_page.locator(sel).first
+            if loc.count() == 0:
+                continue
+            text = loc.inner_text().strip()
+            if text:
+                candidates.append((f"selector:{sel}", text))
+        except Exception:
+            continue
+
+    try:
+        salary_text = detail_page.evaluate(r"""() => {
+            const el = document.querySelector('.salary, [class*="salary"]');
+            return el ? el.innerText.trim() : '';
+        }""")
+        if salary_text:
+            candidates.append(("js_fallback", salary_text))
+    except Exception:
+        pass
+
+    seen: set[str] = set()
+    unique_candidates: list[tuple[str, str]] = []
+    for source, raw in candidates:
+        if raw in seen:
+            continue
+        seen.add(raw)
+        unique_candidates.append((source, raw))
+
+    if not unique_candidates:
+        return None
+
+    for source, raw in unique_candidates:
+        parsed = _parse_salary_to_daily_range(raw)
+        if not parsed:
+            continue
+        daily_min, daily_max, basis = parsed
+        return {
+            "raw": raw,
+            "source": source,
+            "basis": basis,
+            "daily_min": daily_min,
+            "daily_max": daily_max,
+        }
+
+    # 找到了薪资文本，但无法解析成数值
+    source, raw = unique_candidates[0]
+    return {
+        "raw": raw,
+        "source": source,
+        "basis": "unknown",
+        "daily_min": None,
+        "daily_max": None,
+    }
+
+
+def _extract_detail_salary(detail_page: Any) -> int | None:
+    """兼容旧逻辑：返回折算后日薪上限（向下取整）。"""
+    info = _extract_detail_salary_info(detail_page)
+    if not info:
+        return None
+    daily_max = info.get("daily_max")
+    if daily_max is None:
+        return None
+    return int(daily_max)
+
+
+def _min_daily_salary() -> int:
+    """日薪下限（元/天）。优先读 .env，fallback 读 Skill 配置。"""
+    env_val = os.getenv("BOSS_MIN_DAILY_SALARY", "").strip()
+    if env_val.isdigit():
+        return int(env_val)
+    from .skill_loader import get_parameter
+    skill_val = get_parameter("min_daily_salary", "0").strip()
+    return int(skill_val) if skill_val.isdigit() else 0
 
 
 def scan_boss_jobs(
@@ -1890,12 +2246,19 @@ def greet_matching_jobs(
     match_threshold: float | None = None,
     greeting_text: str | None = None,
     job_type: str = "all",
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """涓流式主动打招呼：搜索岗位 → JD匹配 → 对匹配的岗位点击「立即沟通」。
 
-    返回打招呼结果摘要。
+    **核心保障：必须打满 batch_size 个招呼。**
+    搜索一页不够就翻页，翻页不够就换关键词，直到打满或穷尽所有搜索组合。
     """
-    from .workflow import run_jd_analysis
+    _glog = _ensure_guard_debug_logger()
+    if not run_id:
+        run_id = f"manual-{now_beijing().strftime('%Y%m%d-%H%M%S')}"
+
+    from .workflow import run_greet_decision
+    from .storage import log_action
 
     if batch_size is None:
         batch_size = _greet_batch_size()
@@ -1915,202 +2278,288 @@ def greet_matching_jobs(
     remaining = daily_limit - already_today
     effective_batch = min(batch_size, remaining)
 
-    emit(EventType.WORKFLOW_START, f"greet_matching_jobs: keyword={keyword}, batch={effective_batch}, threshold={match_threshold}, job_type={job_type}")
+    emit(
+        EventType.WORKFLOW_START,
+        f"greet_matching_jobs: run_id={run_id}, keyword={keyword}, batch={effective_batch}, job_type={job_type}",
+    )
+    _glog.info(
+        "[GREET][%s] === START === keyword=%r batch=%d job_type=%s daily=%d/%d min_daily_salary=%d",
+        run_id, keyword, effective_batch, job_type, already_today, daily_limit, _min_daily_salary(),
+    )
 
-    search_max = effective_batch * 5
-    scan_items, _, _ = scan_boss_jobs(keyword, max_items=search_max, max_pages=1)
+    MAX_SEARCH_ROUNDS = 5
+    MAX_PAGES_PER_KEYWORD = 3
 
-    if not scan_items:
-        emit(EventType.INFO, "搜索无结果，无法打招呼")
-        return {"greeted": 0, "skipped": 0, "failed": 0, "daily_count": already_today, "daily_limit": daily_limit, "reason": "no_search_results"}
+    fallback_keywords = _build_keyword_list(keyword, job_type)
+    _glog.info("[GREET] 搜索关键词列表: %s", fallback_keywords)
 
-    if job_type != "all":
-        before_count = len(scan_items)
-        passed = []
-        for item in scan_items:
-            ok = _salary_matches_job_type(item.salary, job_type, title=item.title, snippet=item.snippet or "")
-            emit(EventType.INFO if ok else EventType.WARNING,
-                 f"过滤{'通过' if ok else '排除'}: {item.title} | salary=「{item.salary or 'NULL'}」 job_type={job_type}")
-            if ok:
-                passed.append(item)
-        scan_items = passed
-        filtered_count = before_count - len(scan_items)
-        if filtered_count > 0:
-            emit(EventType.INFO, f"岗位过滤：{before_count} 个中排除 {filtered_count} 个不符合 job_type={job_type}（剩余 {len(scan_items)} 个）")
-
-    if not scan_items:
-        emit(EventType.INFO, f"搜索到岗位但全部被 job_type={job_type} 过滤")
-        return {"greeted": 0, "skipped": 0, "failed": 0, "daily_count": already_today, "daily_limit": daily_limit, "reason": "all_filtered_by_job_type"}
-
-    if _need_agent_direction_guard(keyword):
-        before_count = len(scan_items)
-        passed: list[BossScanItem] = []
-        for item in scan_items:
-            ok, reason = _agent_direction_matches(item.title, item.snippet or "")
-            emit(
-                EventType.INFO if ok else EventType.WARNING,
-                f"方向过滤{'通过' if ok else '排除'}: {item.title}@{item.company} reason={reason}",
-            )
-            if ok:
-                passed.append(item)
-        scan_items = passed
-        filtered_count = before_count - len(scan_items)
-        if filtered_count > 0:
-            emit(
-                EventType.INFO,
-                f"方向门控：{before_count} 个中排除 {filtered_count} 个非Agent/应用方向岗位（剩余 {len(scan_items)} 个）",
-            )
-
-    if not scan_items:
-        emit(EventType.INFO, "搜索到岗位但全部被方向门控过滤（非Agent/应用方向）")
-        return {
-            "greeted": 0,
-            "skipped": 0,
-            "failed": 0,
-            "daily_count": already_today,
-            "daily_limit": daily_limit,
-            "reason": "all_filtered_by_direction",
-        }
-
-    # ── 新漏斗架构：逐个打开详情页 → 提取完整JD → LLM二元判断 → 同页打招呼 ──
-    from .workflow import run_greet_decision
-    from .storage import log_action
-
-    no_url = [item for item in scan_items if not item.source_url]
-    if no_url:
-        emit(EventType.WARNING, f"{len(no_url)} 个岗位缺少 URL，跳过")
-        scan_items = [item for item in scan_items if item.source_url]
-
-    if not scan_items:
-        return {"greeted": 0, "skipped": 0, "failed": 0, "daily_count": already_today, "daily_limit": daily_limit, "reason": "no_url"}
-
-    context = _get_browser_context()
-    page = _get_page(context)
-
-    greet_delay_min, greet_delay_max = _greet_delay_ms()
+    seen_urls: set[str] = set()
     greeted = 0
     failed = 0
     llm_rejected = 0
     detail_fail = 0
     greet_results: list[tuple[BossScanItem, bool, str]] = []
 
-    for idx, item in enumerate(scan_items):
+    context = _get_browser_context()
+    page = _get_page(context)
+    greet_delay_min, greet_delay_max = _greet_delay_ms()
+    min_salary = _min_daily_salary()
+
+    round_num = 0
+
+    for kw_idx, current_kw in enumerate(fallback_keywords):
         if greeted >= effective_batch:
             break
 
-        emit(EventType.INFO, f"[{idx+1}/{len(scan_items)}] 导航到详情页: {item.title}@{item.company}")
+        for page_num in range(1, MAX_PAGES_PER_KEYWORD + 1):
+            if greeted >= effective_batch:
+                break
+            round_num += 1
+            if round_num > MAX_SEARCH_ROUNDS:
+                _glog.info("[GREET] 达到最大搜索轮数 %d，停止", MAX_SEARCH_ROUNDS)
+                break
 
-        try:
-            page.goto(item.source_url, wait_until="domcontentloaded", timeout=15000)
-            page.wait_for_timeout(random.randint(1500, 2500))
-        except Exception as exc:
-            emit(EventType.WARNING, f"导航失败: {item.title} → {exc}")
-            detail_fail += 1
-            continue
+            _glog.info("[GREET] 第 %d 轮: keyword=%r page=%d (greeted=%d/%d)",
+                       round_num, current_kw, page_num, greeted, effective_batch)
+            emit(EventType.INFO, f"搜索第 {round_num} 轮: keyword={current_kw} page={page_num} (已打{greeted}/{effective_batch})")
 
-        if _check_login_required(page):
-            _handle_cookie_expired(page, "打招呼-详情页")
-            failed += len(scan_items) - idx
-            break
+            scan_items: list[BossScanItem] = []
 
-        full_jd = _extract_detail_text(page)
-        if not full_jd or len(full_jd.strip()) < 20:
-            emit(EventType.WARNING, f"详情页JD提取失败或内容过短: {item.title} (len={len(full_jd.strip()) if full_jd else 0})")
-            full_jd = item.snippet or ""
-
-        jd_context = f"岗位标题：{item.title}\n公司：{item.company}\n薪资：{item.salary or '未知'}\n\n职位描述：\n{full_jd}"
-
-        emit(EventType.INFO, f"LLM二元判断中: {item.title} (JD长度={len(full_jd)}字)")
-        decision = run_greet_decision(jd_context)
-
-        if not decision.should_greet:
-            llm_rejected += 1
-            greet_results.append((item, False, f"LLM拒绝: {decision.reason}"))
-            emit(EventType.WARNING, f"LLM拒绝打招呼: {item.title}@{item.company} | reason={decision.reason} | confidence={decision.confidence}")
-            continue
-
-        emit(EventType.INFO, f"LLM通过: {item.title}@{item.company} | reason={decision.reason} | confidence={decision.confidence}")
-
-        greet_btn = None
-        for sel in [
-            ".btn-startchat",
-            ".start-chat-btn",
-            "a.btn-startchat",
-            ".job-op .btn",
-            "button:has-text('立即沟通')",
-            "a:has-text('立即沟通')",
-            ":has-text('立即沟通')",
-        ]:
-            try:
-                loc = page.locator(sel)
-                if loc.count() > 0 and loc.first.is_visible():
-                    greet_btn = loc.first
+            if page_num == 1:
+                scan_items, _, _ = scan_boss_jobs(current_kw, max_items=15, max_pages=1)
+            else:
+                url = _boss_search_url(current_kw, page=page_num)
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(1500)
+                    scan_items = _extract_cards(page, max_items=15)
+                except Exception as exc:
+                    _glog.warning("[GREET] 翻页失败 page=%d: %s", page_num, exc)
                     break
-            except Exception:
+
+            if not scan_items:
+                _glog.info("[GREET] keyword=%r page=%d 搜索无结果", current_kw, page_num)
+                break
+
+            new_items = [item for item in scan_items if item.source_url and item.source_url not in seen_urls]
+            for item in new_items:
+                if item.source_url:
+                    seen_urls.add(item.source_url)
+
+            if not new_items:
+                _glog.info("[GREET] keyword=%r page=%d 全部已见过，换页/换词", current_kw, page_num)
                 continue
 
-        if not greet_btn:
-            already_chatted = False
-            for sel in [
-                "button:has-text('继续沟通')",
-                "a:has-text('继续沟通')",
-                ":has-text('继续沟通')",
-            ]:
+            if job_type != "all":
+                before = len(new_items)
+                new_items = [item for item in new_items
+                             if _salary_matches_job_type(item.salary, job_type, title=item.title, snippet=item.snippet or "")]
+                if before - len(new_items) > 0:
+                    _glog.info("[GREET] job_type过滤: %d → %d", before, len(new_items))
+
+            if _need_agent_direction_guard(current_kw):
+                before = len(new_items)
+                passed_dir: list[BossScanItem] = []
+                for item in new_items:
+                    ok, reason = _agent_direction_matches(item.title, item.snippet or "")
+                    if ok:
+                        passed_dir.append(item)
+                    else:
+                        emit(EventType.WARNING, f"方向过滤排除: {item.title}@{item.company} reason={reason}")
+                new_items = passed_dir
+                if before - len(new_items) > 0:
+                    _glog.info("[GREET] 方向门控过滤: %d → %d", before, len(new_items))
+                    emit(EventType.INFO, f"方向门控：{before} 个中排除 {before - len(new_items)} 个（剩余 {len(new_items)} 个）")
+
+            if not new_items:
+                _glog.info("[GREET] keyword=%r page=%d 过滤后无剩余", current_kw, page_num)
+                continue
+
+            for idx, item in enumerate(new_items):
+                if greeted >= effective_batch:
+                    break
+
+                emit(EventType.INFO, f"[{idx+1}/{len(new_items)}] 导航到详情页: {item.title}@{item.company}")
+                _glog.info("[GREET] 检查: %s @ %s url=%s", item.title, item.company, (item.source_url or "")[:60])
+
                 try:
-                    loc = page.locator(sel)
-                    if loc.count() > 0 and loc.first.is_visible():
-                        already_chatted = True
-                        break
-                except Exception:
+                    page.goto(item.source_url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(random.randint(1500, 2500))
+                except Exception as exc:
+                    emit(EventType.WARNING, f"导航失败: {item.title} → {exc}")
+                    _glog.warning("[GREET] 导航失败: %s → %s", item.title, str(exc)[:100])
+                    detail_fail += 1
                     continue
-            if already_chatted:
-                greet_results.append((item, False, "已沟通过"))
-                emit(EventType.INFO, f"已沟通过，跳过: {item.title}@{item.company}")
-            else:
-                failed += 1
-                greet_results.append((item, False, "未找到「立即沟通」按钮"))
-                emit(EventType.WARNING, f"未找到沟通按钮: {item.title}@{item.company}")
-            continue
 
-        try:
-            greet_btn.click(timeout=5000)
-            emit(EventType.BROWSER_CLICK, f"点击「立即沟通」: {item.title}@{item.company}")
-            page.wait_for_timeout(random.randint(2000, 3500))
-            _dismiss_greet_modal(page)
+                if _check_login_required(page):
+                    _handle_cookie_expired(page, "打招呼-详情页")
+                    _glog.error("[GREET] Cookie过期，中断")
+                    failed += len(new_items) - idx
+                    break
 
-            greeted += 1
-            greet_results.append((item, True, f"LLM: {decision.reason}"))
-            log_action(
-                job_id=None,
-                action_type="boss_greet",
-                input_summary=f"keyword={keyword}; title={item.title}; company={item.company}; url={item.source_url}; llm_reason={decision.reason}",
-                output_summary=f"greeted=true; daily_count={_greet_today_count()}/{daily_limit}",
-                status="success",
-            )
-            emit(EventType.REPLY_SENT, f"打招呼成功: {item.title}@{item.company} (今日第{_greet_today_count()}个)")
+                full_jd = _extract_detail_text(page)
+                if not full_jd or len(full_jd.strip()) < 20:
+                    emit(EventType.WARNING, f"详情页JD提取失败或内容过短: {item.title}")
+                    full_jd = item.snippet or ""
 
-        except Exception as exc:
-            failed += 1
-            greet_results.append((item, False, str(exc)[:200]))
-            log_action(
-                job_id=None,
-                action_type="boss_greet",
-                input_summary=f"keyword={keyword}; title={item.title}; company={item.company}; url={item.source_url}",
-                output_summary=f"greeted=false; error={exc}",
-                status="error",
-            )
-            emit(EventType.WARNING, f"打招呼失败: {item.title}@{item.company}: {exc}")
+                if min_salary > 0:
+                    salary_info = _extract_detail_salary_info(page)
+                    if salary_info is None:
+                        emit(EventType.WARNING, f"薪资信息缺失: {item.title} | 未找到薪资文本，跳过薪资门槛")
+                        _glog.warning("[GREET] 薪资信息缺失: %s", item.title)
+                    else:
+                        raw_salary = str(salary_info.get("raw") or "")
+                        basis = str(salary_info.get("basis") or "unknown")
+                        source = str(salary_info.get("source") or "-")
+                        daily_min = salary_info.get("daily_min")
+                        daily_max = salary_info.get("daily_max")
 
-        if idx < len(scan_items) - 1:
-            wait_ms = random.randint(greet_delay_min, greet_delay_max)
-            emit(EventType.INFO, f"打招呼间隔等待 {wait_ms/1000:.1f}s...")
-            page.wait_for_timeout(wait_ms)
+                        if daily_max is None:
+                            emit(EventType.WARNING, f"薪资解析失败: {item.title} | raw={raw_salary}，跳过薪资门槛")
+                            _glog.warning(
+                                "[GREET] 薪资解析失败: %s | source=%s raw=%s",
+                                item.title, source, raw_salary[:120],
+                            )
+                        else:
+                            span = f"{_format_money(daily_min)}~{_format_money(daily_max)}"
+                            emit(EventType.INFO, f"薪资解析: {item.title} | raw={raw_salary} | {basis}折算日薪={span}元/天")
+                            _glog.info(
+                                "[GREET] 薪资解析: %s | source=%s raw=%s basis=%s daily=%s",
+                                item.title, source, raw_salary[:120], basis, span,
+                            )
 
-    skipped = len(scan_items) - greeted - failed - llm_rejected - detail_fail
+                            # 区间判定：只看上限。上限 >= 下限就允许（有谈判空间）。
+                            if daily_max < min_salary:
+                                reason = (
+                                    f"薪资不达标: 折算日薪上限 {_format_money(daily_max)}元/天 "
+                                    f"< {min_salary}元/天 (raw={raw_salary})"
+                                )
+                                greet_results.append((item, False, reason))
+                                emit(EventType.WARNING, f"薪资不达标: {item.title} | {reason}")
+                                _glog.info("[GREET] 薪资不达标: %s | %s", item.title, reason[:160])
+                                continue
+                            emit(
+                                EventType.INFO,
+                                f"薪资检查通过: {item.title} | 折算日薪上限 {_format_money(daily_max)}元/天 >= {min_salary}元/天",
+                            )
+
+                jd_context = f"岗位标题：{item.title}\n公司：{item.company}\n薪资：{item.salary or '未知'}\n\n职位描述：\n{full_jd}"
+
+                emit(EventType.INFO, f"LLM二元判断中: {item.title} (JD长度={len(full_jd)}字)")
+                decision = run_greet_decision(jd_context)
+
+                if not decision.should_greet:
+                    llm_rejected += 1
+                    greet_results.append((item, False, f"LLM拒绝: {decision.reason}"))
+                    emit(EventType.WARNING, f"LLM拒绝打招呼: {item.title}@{item.company} | reason={decision.reason}")
+                    _glog.info("[GREET] LLM拒绝: %s | %s", item.title, decision.reason[:80])
+                    continue
+
+                emit(EventType.INFO, f"LLM通过: {item.title}@{item.company} | reason={decision.reason}")
+                _glog.info("[GREET] LLM通过: %s | %s", item.title, decision.reason[:80])
+
+                greet_btn = None
+                for sel in [
+                    ".btn-startchat",
+                    ".start-chat-btn",
+                    "a.btn-startchat",
+                    ".job-op .btn",
+                    "button:has-text('立即沟通')",
+                    "a:has-text('立即沟通')",
+                    ":has-text('立即沟通')",
+                ]:
+                    try:
+                        loc = page.locator(sel)
+                        if loc.count() > 0 and loc.first.is_visible():
+                            greet_btn = loc.first
+                            break
+                    except Exception:
+                        continue
+
+                if not greet_btn:
+                    already_chatted = False
+                    for sel in [
+                        "button:has-text('继续沟通')",
+                        "a:has-text('继续沟通')",
+                        ":has-text('继续沟通')",
+                    ]:
+                        try:
+                            loc = page.locator(sel)
+                            if loc.count() > 0 and loc.first.is_visible():
+                                already_chatted = True
+                                break
+                        except Exception:
+                            continue
+                    if already_chatted:
+                        greet_results.append((item, False, "已沟通过"))
+                        emit(EventType.INFO, f"已沟通过，跳过: {item.title}@{item.company}")
+                        _glog.info("[GREET] 已沟通过: %s", item.title)
+                    else:
+                        failed += 1
+                        greet_results.append((item, False, "未找到「立即沟通」按钮"))
+                        emit(EventType.WARNING, f"未找到沟通按钮: {item.title}@{item.company}")
+                        _glog.warning("[GREET] 未找到按钮: %s", item.title)
+                    continue
+
+                try:
+                    greet_btn.click(timeout=5000)
+                    emit(EventType.BROWSER_CLICK, f"点击「立即沟通」: {item.title}@{item.company}")
+                    page.wait_for_timeout(random.randint(2000, 3500))
+                    _dismiss_greet_modal(page)
+
+                    greeted += 1
+                    greet_results.append((item, True, f"LLM: {decision.reason}"))
+                    log_action(
+                        job_id=None,
+                        action_type="boss_greet",
+                        input_summary=f"keyword={current_kw}; title={item.title}; company={item.company}; url={item.source_url}; llm_reason={decision.reason}",
+                        output_summary=f"greeted=true; daily_count={_greet_today_count()}/{daily_limit}",
+                        status="success",
+                    )
+                    emit(EventType.REPLY_SENT, f"打招呼成功: {item.title}@{item.company} (今日第{_greet_today_count()}个)")
+                    _glog.info("[GREET] ✓ 成功打招呼 #%d: %s @ %s", greeted, item.title, item.company)
+
+                except Exception as exc:
+                    failed += 1
+                    greet_results.append((item, False, str(exc)[:200]))
+                    log_action(
+                        job_id=None,
+                        action_type="boss_greet",
+                        input_summary=f"keyword={current_kw}; title={item.title}; company={item.company}; url={item.source_url}",
+                        output_summary=f"greeted=false; error={exc}",
+                        status="error",
+                    )
+                    emit(EventType.WARNING, f"打招呼失败: {item.title}@{item.company}: {exc}")
+                    _glog.error("[GREET] 打招呼点击失败: %s → %s", item.title, str(exc)[:100])
+
+                wait_ms = random.randint(greet_delay_min, greet_delay_max)
+                emit(EventType.INFO, f"打招呼间隔等待 {wait_ms/1000:.1f}s...")
+                page.wait_for_timeout(wait_ms)
+
+        if round_num > MAX_SEARCH_ROUNDS:
+            break
+
+    skipped = len(seen_urls) - greeted - failed - llm_rejected - detail_fail
+    if skipped < 0:
+        skipped = 0
     cleanup_browser_tabs()
+
+    reason = None
+    if greeted >= effective_batch:
+        reason = "batch_fulfilled"
+    elif round_num >= MAX_SEARCH_ROUNDS:
+        reason = "max_rounds_exhausted"
+    else:
+        reason = "all_keywords_exhausted"
+
+    _glog.info(
+        "[GREET][%s] === END === greeted=%d/%d failed=%d llm_rejected=%d detail_fail=%d reason=%s rounds=%d unique_jobs=%d",
+        run_id, greeted, effective_batch, failed, llm_rejected, detail_fail, reason, round_num, len(seen_urls),
+    )
+
     emit(EventType.WORKFLOW_END,
-         f"greet_matching_jobs 完成: greeted={greeted}, llm_rejected={llm_rejected}, "
-         f"detail_fail={detail_fail}, failed={failed}, skipped={skipped}")
+         f"greet_matching_jobs 完成: greeted={greeted}/{effective_batch}, llm_rejected={llm_rejected}, "
+         f"detail_fail={detail_fail}, failed={failed}, reason={reason}, rounds={round_num}")
     return {
         "greeted": greeted,
         "failed": failed,
@@ -2119,8 +2568,31 @@ def greet_matching_jobs(
         "skipped": skipped,
         "daily_count": _greet_today_count(),
         "daily_limit": daily_limit,
+        "reason": reason,
+        "rounds": round_num,
         "matched_details": [
             {"title": item.title, "company": item.company, "success": success, "detail": detail}
             for item, success, detail in greet_results
         ],
     }
+
+
+def _build_keyword_list(primary_keyword: str, job_type: str) -> list[str]:
+    """构建多关键词搜索列表，用于当一个关键词搜不到足够合适岗位时轮换。"""
+    keywords = [primary_keyword]
+
+    suffix = " 实习" if job_type == "intern" else ""
+
+    variants = [
+        f"AI Agent{suffix}",
+        f"大模型开发{suffix}",
+        f"LLM应用{suffix}",
+        f"NLP算法{suffix}",
+        f"AIGC{suffix}",
+    ]
+
+    for v in variants:
+        if v != primary_keyword and v not in keywords:
+            keywords.append(v)
+
+    return keywords
