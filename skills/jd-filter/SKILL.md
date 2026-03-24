@@ -50,7 +50,6 @@ metadata: {"openclaw": {"always": true}}
 - copilot
 - tool call
 - function call
-- 产品
 
 ### Accept（一般接受信号 — 仅在无 Reject 信号时放行）
 
@@ -87,6 +86,12 @@ metadata: {"openclaw": {"always": true}}
 - 视觉算法
 - 多模态训练
 - 基座研发
+- 产品经理
+- 产品实习
+- 产品策划
+- 产品运营
+- 用户研究
+- 增长运营
 
 ### Title Block（标题含以下词且无明确应用导向时直接拦截）
 
@@ -110,6 +115,7 @@ metadata: {"openclaw": {"always": true}}
 
 - 岗位核心工作是模型预训练/后训练/RLHF/SFT/蒸馏，而非应用开发
 - 岗位核心工作是传统算法（推荐/搜索/CV/NLP基础研究），而非LLM应用
+- 岗位核心职责偏产品（如产品经理/产品实习/需求分析/PRD输出），而非研发编码落地
 - 岗位核心工作是测试/QA/运维，而非开发
 - 岗位要求博士学历（候选人硕士）
 - 岗位日薪明确低于200元/天
@@ -121,7 +127,8 @@ metadata: {"openclaw": {"always": true}}
 
 ### Principle（判断原则）
 
-- 宁缺毋滥：不确定时拒绝
+- 以候选人核心目标为先：优先保留能积累 Agent/LLM 应用实战经验的岗位
+- 在岗位方向大体契合时，不要因表述模糊过度拒绝；给出可执行的保守通过理由
 - 地点不作为拒绝理由
 - 重点看JD中的工作职责和岗位描述的具体工作内容，不要被标题迷惑
 - 候选人的求职核心目标是最高优先级
@@ -136,4 +143,6 @@ metadata: {"openclaw": {"always": true}}
 | batch_size | 3 | 每轮打招呼数量 |
 | daily_limit | 50 | 每日打招呼上限 |
 | search_multiplier | 5 | 搜索量 = batch_size × 此值 |
+| max_pages_per_keyword | 3 | 每个关键词最多翻页数 |
+| must_fill_batch | true | 若严格筛选不足 batch_size，启用放宽/补齐策略 |
 | min_daily_salary | 200 | 日薪下限（元/天），低于此值直接拒绝 |

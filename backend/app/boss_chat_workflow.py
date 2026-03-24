@@ -195,7 +195,11 @@ def _estimate_proactive_contact(
         }
     )
     try:
-        parsed: _ProactiveContactParsed = _invoke_structured(prompt, _ProactiveContactParsed)
+        parsed: _ProactiveContactParsed = _invoke_structured(
+            prompt,
+            _ProactiveContactParsed,
+            route="proactive_contact",
+        )
         reason = str(parsed.reason or "").strip() or "主动联系判定完成。"
         return bool(parsed.is_proactive_hr), float(parsed.confidence), reason
     except Exception:
@@ -253,7 +257,11 @@ def _estimate_source_fit(
         }
     )
     try:
-        parsed: _SourceFitParsed = _invoke_structured(prompt, _SourceFitParsed)
+        parsed: _SourceFitParsed = _invoke_structured(
+            prompt,
+            _SourceFitParsed,
+            route="source_fit",
+        )
         reason = str(parsed.reason or "").strip() or "来源匹配评估完成。"
         return float(parsed.fit_score), bool(parsed.should_engage), reason
     except Exception:
@@ -680,6 +688,23 @@ def _build_graph():
 _GRAPH = _build_graph()
 
 
+def _run_copilot_pipeline(initial_state: BossChatCopilotState) -> BossChatCopilotState:
+    # 对话巡检链路固定为串行节点，直接顺序执行可避免在 LangGraph 内部
+    # 触发 asyncio loop 与 Patchright Sync API 的兼容性冲突。
+    state: BossChatCopilotState = dict(initial_state)
+    for node in (
+        _load_profile_node,
+        _pull_conversations_node,
+        _source_check_node,
+        _proactive_gate_node,
+        _decision_node,
+    ):
+        node_output = node(state)
+        if node_output:
+            state.update(node_output)
+    return state
+
+
 def _auto_execute_enabled() -> bool:
     raw = os.getenv("BOSS_CHAT_AUTO_EXECUTE_ENABLED", "true").strip().lower()
     return raw in ("1", "true", "yes", "on")
@@ -696,7 +721,7 @@ def run_boss_chat_copilot_workflow(
     chat_tab: str = "未读",
 ) -> BossChatProcessResponse:
     emit(EventType.WORKFLOW_START, f"boss_chat_copilot: 启动智能聊天处理流水线 (tab={chat_tab})")
-    state = _GRAPH.invoke(
+    state = _run_copilot_pipeline(
         {
             "max_conversations": max_conversations,
             "unread_only": unread_only,

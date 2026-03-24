@@ -97,6 +97,49 @@ CLEANUP_INTERVAL        = _env_int("GUARD_CLEANUP_INTERVAL", 300)         # 5min
 PEAK_HOURS = [(10, 12), (14, 18)]
 
 
+def _pick_target_keyword(targets: list[str], job_type: str) -> str:
+    """从画像目标岗位中优先挑 Agent/应用导向关键词。"""
+    if not targets:
+        return ""
+    hints = [
+        "agent", "智能体", "rag", "langgraph", "langchain", "mcp",
+        "应用", "应用开发", "工程化", "llm应用", "copilot",
+    ]
+    for raw in targets:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        lower = text.lower()
+        if any(h in lower for h in hints):
+            if job_type == "intern" and "实习" not in text:
+                return f"{text} 实习"
+            return text
+    # 没有强匹配时，先用第一个，但会在 _normalize_guard_keyword 里再做兜底收敛
+    return (targets[0] or "").strip()
+
+
+def _normalize_guard_keyword(keyword: str, job_type: str) -> str:
+    """规避过泛关键词，保证主动打招呼聚焦 Agent/应用实习。"""
+    kw = (keyword or "").strip()
+    lower = kw.lower()
+
+    if not kw:
+        kw = "AI Agent 实习" if job_type == "intern" else "AI Agent 开发"
+        lower = kw.lower()
+
+    # 纯“大模型/LLM/AI”太泛，容易搜到大量算法岗；统一收敛到 Agent/应用导向。
+    too_broad = (
+        lower in {"大模型", "llm", "ai", "人工智能"}
+        or ("大模型" in kw and not any(t in lower for t in ["agent", "智能体", "应用", "rag", "langgraph", "langchain", "mcp"]))
+    )
+    if too_broad:
+        kw = "AI Agent 实习" if job_type == "intern" else "AI Agent 开发"
+
+    if job_type == "intern" and "实习" not in kw:
+        kw = f"{kw} 实习"
+    return kw
+
+
 def _is_weekend() -> bool:
     return _now_local().weekday() >= 5
 
@@ -299,20 +342,21 @@ class ProductionGuard:
 
             run_id = f"greet-{now_beijing().strftime('%Y%m%d-%H%M%S')}"
             profile = get_user_profile("default")
-            job_type = "all"
+            job_type = os.getenv("BOSS_GREET_FALLBACK_JOB_TYPE", "intern").strip() or "intern"
             keyword = ""
             if profile and isinstance(profile.get("profile"), dict):
                 pref = profile["profile"].get("job_preference", {})
-                job_type = pref.get("job_type", "all")
+                job_type = (pref.get("job_type") or job_type).strip()
                 targets = pref.get("target_positions") or []
-                if targets:
-                    keyword = targets[0]
+                keyword = _pick_target_keyword(targets, job_type)
 
             if not keyword:
-                keyword = "大模型 实习" if job_type == "intern" else "大模型"
+                keyword = os.getenv(
+                    "BOSS_GREET_FALLBACK_KEYWORD",
+                    "AI Agent 实习" if job_type == "intern" else "AI Agent 开发",
+                ).strip()
 
-            if job_type == "intern" and "实习" not in keyword:
-                keyword = f"{keyword} 实习"
+            keyword = _normalize_guard_keyword(keyword, job_type)
 
             glog.info("=== GREET START === run_id=%s keyword=%r job_type=%s", run_id, keyword, job_type)
             logger.info("Guard greet: keyword=%r job_type=%s", keyword, job_type)

@@ -243,7 +243,11 @@ def generate_company_intel(
     )
 
     try:
-        parsed: _CompanyIntelParsed = _invoke_structured(prompt, _CompanyIntelParsed)
+        parsed: _CompanyIntelParsed = _invoke_structured(
+            prompt,
+            _CompanyIntelParsed,
+            route="company_intel",
+        )
         return CompanyIntelResponse(
             company=safe_company,
             role_title=role_title,

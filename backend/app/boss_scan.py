@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import json
 import logging
 import os
 import random
@@ -154,6 +157,92 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _greet_audit_log_path() -> Path:
+    return _project_root() / "backend" / "logs" / "greet_audit.jsonl"
+
+
+def _greet_audit_jd_max_chars() -> int:
+    raw = os.getenv("BOSS_GREET_AUDIT_JD_MAX_CHARS", "2500").strip()
+    try:
+        return max(300, min(int(raw), 12000))
+    except ValueError:
+        return 2500
+
+
+def _compact_text(text: str | None, max_chars: int) -> str:
+    s = " ".join((text or "").split()).strip()
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars] + "...(truncated)"
+
+
+def _greet_decision_model_chain() -> list[str]:
+    chain = [
+        os.getenv("MODEL_ROUTE_GREET_DECISION_PRIMARY", "").strip(),
+        os.getenv("MODEL_ROUTE_GREET_DECISION_FALLBACK", "").strip(),
+        os.getenv("MODEL_PRIMARY", "").strip(),
+        os.getenv("MODEL_FALLBACK", "").strip(),
+        "qwen3-max",
+        "qwen-plus",
+    ]
+    uniq: list[str] = []
+    for model in chain:
+        if model and model not in uniq:
+            uniq.append(model)
+    return uniq
+
+
+def _write_greet_audit(record: dict[str, Any], glog: logging.Logger | None = None) -> None:
+    try:
+        path = _greet_audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        if glog is not None:
+            glog.warning("[GREET][AUDIT] write failed: %s", str(exc)[:200])
+
+
+def _audit_greet_candidate(
+    *,
+    run_id: str,
+    keyword: str,
+    round_num: int,
+    page_num: int | None,
+    item: BossScanItem,
+    stage: str,
+    outcome: str,
+    reason: str,
+    decision_model_chain: list[str],
+    jd_text: str | None = None,
+    llm_confidence: str | None = None,
+    extra: dict[str, Any] | None = None,
+    glog: logging.Logger | None = None,
+) -> None:
+    jd_max = _greet_audit_jd_max_chars()
+    record: dict[str, Any] = {
+        "timestamp": now_beijing().isoformat(),
+        "run_id": run_id,
+        "keyword": keyword,
+        "round_num": round_num,
+        "page_num": page_num,
+        "stage": stage,
+        "outcome": outcome,
+        "reason": reason,
+        "title": item.title,
+        "company": item.company,
+        "url": item.source_url,
+        "salary": item.salary,
+        "decision_model_chain": decision_model_chain,
+        "jd_excerpt": _compact_text(jd_text or item.snippet or "", jd_max),
+    }
+    if llm_confidence:
+        record["llm_confidence"] = llm_confidence
+    if extra:
+        record["extra"] = extra
+    _write_greet_audit(record, glog=glog)
+
+
 def _clear_profile_lock_files(profile_dir: Path) -> None:
     """清理 Chrome profile 的残留锁文件（崩溃恢复场景）。"""
     for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
@@ -210,6 +299,21 @@ _browser_lock = threading.Lock()
 _LOCK_TIMEOUT = 60
 _browser_pw: Any = None
 _browser_context: Any = None
+_BOSS_SYNC_THREAD_PREFIX = "boss-sync"
+_BOSS_SYNC_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix=_BOSS_SYNC_THREAD_PREFIX,
+)
+
+
+def _in_boss_sync_thread() -> bool:
+    return threading.current_thread().name.startswith(_BOSS_SYNC_THREAD_PREFIX)
+
+
+def _dispatch_to_boss_sync(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+    """在专用线程中执行 Patchright Sync API 逻辑，规避 asyncio loop 冲突。"""
+    future = _BOSS_SYNC_EXECUTOR.submit(func, *args, **kwargs)
+    return future.result()
 
 
 def _get_browser_context() -> Any:
@@ -554,6 +658,39 @@ def _greet_match_threshold() -> float:
         return 70.0
 
 
+def _greet_search_multiplier() -> int:
+    """搜索预算倍数：越大越容易打满 batch，但耗时更久。"""
+    raw = os.getenv("BOSS_GREET_SEARCH_MULTIPLIER", "").strip()
+    if not raw:
+        from .skill_loader import get_parameter
+        raw = get_parameter("search_multiplier", "5")
+    try:
+        return max(2, min(int(raw), 20))
+    except ValueError:
+        return 5
+
+
+def _greet_max_pages_per_keyword() -> int:
+    """每个关键词最多翻页数。"""
+    raw = os.getenv("BOSS_GREET_MAX_PAGES_PER_KEYWORD", "").strip()
+    if not raw:
+        from .skill_loader import get_parameter
+        raw = get_parameter("max_pages_per_keyword", "3")
+    try:
+        return max(1, min(int(raw), 8))
+    except ValueError:
+        return 3
+
+
+def _greet_force_fill_batch() -> bool:
+    """是否启用“补齐 batch”策略（默认开启）。"""
+    raw = os.getenv("BOSS_GREET_FORCE_FILL_BATCH", "").strip().lower()
+    if not raw:
+        from .skill_loader import get_parameter
+        raw = str(get_parameter("must_fill_batch", "true")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 _FULLTIME_SALARY_RE = re.compile(r"\d+[kK]|\d+-\d+[kK]|\d+万")
 _INTERN_SALARY_RE = re.compile(r"\d+.*[/·].*天|\d+.*元.*天|天/|/天")
 _INTERN_TITLE_KEYWORDS = re.compile(r"实习|intern|日薪|兼职", re.IGNORECASE)
@@ -571,6 +708,76 @@ _FALLBACK_NEGATIVE_RE = re.compile(
     r"算法研究|推荐算法|搜索算法|视觉算法|多模态训练|基座研发",
     re.IGNORECASE,
 )
+
+# 放宽阶段的“软匹配”规则：用于严格模式凑不满 batch 时的补齐策略。
+_RELAX_POSITIVE_RE = re.compile(
+    r"agent|智能体|大模型|llm|rag|langgraph|langchain|mcp|aigc|"
+    r"应用开发|应用工程|研发|工程师|开发实习|ai应用",
+    re.IGNORECASE,
+)
+_RELAX_NEGATIVE_RE = re.compile(
+    r"产品经理|产品实习|运营|销售|商务|市场|客服|标注|测试|qa|评测|数据运营|内容运营",
+    re.IGNORECASE,
+)
+
+
+_PRODUCT_TRACK_TITLE_RE = re.compile(
+    r"产品经理|产品实习|产品策划|产品运营|用户研究|增长运营|商业分析|"
+    r"product\s*manager|product\s*owner|product\s*intern|\bpm\b",
+    re.IGNORECASE,
+)
+_PRODUCT_TRACK_EXEMPT_RE = re.compile(
+    r"研发|开发|工程师|软件|后端|前端|全栈|算法工程师|engineer|developer",
+    re.IGNORECASE,
+)
+_ENGINEERING_ROLE_RE = re.compile(
+    r"后端|前端|全栈|研发|开发|工程师|软件|架构|java|python|go|c\+\+|"
+    r"backend|frontend|full[\s-]?stack|software|engineer|developer",
+    re.IGNORECASE,
+)
+_AI_RND_SIGNAL_RE = re.compile(
+    r"agent|智能体|大模型|llm|aigc|rag|langgraph|langchain|mcp|prompt|"
+    r"tool\s*call|function\s*call|embedding|向量|检索增强|知识库|多智能体|copilot",
+    re.IGNORECASE,
+)
+
+
+def _is_product_track_role(title: str, snippet: str = "") -> bool:
+    """是否为产品方向岗位（用于研发岗硬过滤）。"""
+    t = (title or "").strip()
+    if not t:
+        return False
+
+    # 标题命中产品角色信号，且不是“产品研发工程师”这类研发岗。
+    if _PRODUCT_TRACK_TITLE_RE.search(t):
+        if _PRODUCT_TRACK_EXEMPT_RE.search(t):
+            return False
+        return True
+
+    # 次级兜底：标题含“产品”且具备典型产品职能词，按产品岗处理。
+    if "产品" in t and re.search(r"经理|策划|运营|增长|研究|专家|主管", t, re.IGNORECASE):
+        return True
+
+    s = (snippet or "").strip()
+    if "产品" in t and re.search(
+        r"需求分析|需求管理|prd|路线图|用户访谈|竞品分析",
+        s,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
+
+
+def _is_non_ai_engineering_role(title: str, jd_text: str = "", snippet: str = "") -> bool:
+    """识别“研发岗但与 AI/Agent 无关”的岗位。"""
+    t = (title or "").strip()
+    if not t:
+        return False
+    if not _ENGINEERING_ROLE_RE.search(t):
+        return False
+    merged = f"{t}\n{jd_text or ''}\n{snippet or ''}"
+    return not bool(_AI_RND_SIGNAL_RE.search(merged))
 
 
 def _is_intern_salary(salary: str | None) -> bool:
@@ -664,7 +871,7 @@ def _agent_direction_matches(title: str, snippet: str) -> tuple[bool, str]:
     _pos_re = cfg.accept_re if (cfg.accept_keywords or cfg.strong_accept_keywords) else _FALLBACK_POSITIVE_RE
     _neg_re = cfg.reject_re if cfg.reject_keywords else _FALLBACK_NEGATIVE_RE
     _strong_re = cfg.strong_accept_re if cfg.strong_accept_keywords else re.compile(
-        r"应用|落地|工作流|rag|langgraph|langchain|mcp|copilot|tool\s*call|function\s*call|产品",
+        r"应用|落地|工作流|rag|langgraph|langchain|mcp|copilot|tool\s*call|function\s*call",
         re.IGNORECASE,
     )
     block_kws = cfg.title_block_keywords or ["算法"]
@@ -681,6 +888,10 @@ def _agent_direction_matches(title: str, snippet: str) -> tuple[bool, str]:
     title_has_explicit_app_track = any(kw.lower() in title_lower for kw in require_app_kws)
     title_has_agent = bool(re.search(r"agent|智能体|应用", title or "", re.IGNORECASE))
 
+    # 硬规则：产品岗不打招呼（即使语义上接近 Agent/AI 应用）。
+    if _is_product_track_role(title, snippet):
+        return False, "hit_product_track_role"
+
     # 强规则：标题带“算法”默认判为算法岗，除非标题明确写了应用/开发导向（宁缺毋滥）
     if title_has_algo and not title_has_explicit_app_track:
         return False, "title_contains_algorithm"
@@ -696,6 +907,35 @@ def _agent_direction_matches(title: str, snippet: str) -> tuple[bool, str]:
     if has_positive and not has_negative:
         return True, "hit_positive_keywords"
     return False, "missing_agent_application_keywords"
+
+
+def _is_relaxed_target_candidate(title: str, text: str, llm_reason: str = "") -> bool:
+    """放宽阶段是否可纳入补齐候选（软约束，不改变硬约束）。"""
+    if _is_product_track_role(title, text):
+        return False
+    merged = f"{title}\n{text}\n{llm_reason}".strip()
+    has_pos = bool(_RELAX_POSITIVE_RE.search(merged))
+    has_neg = bool(_RELAX_NEGATIVE_RE.search(merged))
+    if has_neg and not has_pos:
+        return False
+    return has_pos
+
+
+def _fallback_priority(title: str, text: str, llm_reason: str, daily_max: float | None) -> float:
+    """补齐候选排序分：优先工程/Agent 相关，薪资上限越高优先级越高。"""
+    merged = f"{title}\n{text}\n{llm_reason}".strip()
+    score = 0.0
+    if _is_product_track_role(title, text):
+        score -= 6.0
+    if _RELAX_POSITIVE_RE.search(merged):
+        score += 3.0
+    if _RELAX_NEGATIVE_RE.search(merged):
+        score -= 4.0
+    if re.search(r"产品经理", merged, re.IGNORECASE):
+        score -= 3.0
+    if daily_max is not None:
+        score += min(float(daily_max), 600.0) / 200.0
+    return score
 
 
 _BOSS_CHAT_URL = "https://www.zhipin.com/web/geek/chat"
@@ -1087,6 +1327,14 @@ def scan_boss_jobs(
     max_items: int = 10,
     max_pages: int = 1,
 ) -> tuple[list[BossScanItem], str | None, int]:
+    if not _in_boss_sync_thread():
+        return _dispatch_to_boss_sync(
+            scan_boss_jobs,
+            keyword,
+            max_items=max_items,
+            max_pages=max_pages,
+        )
+
     from patchright.sync_api import TimeoutError as PlaywrightTimeoutError
 
     emit(EventType.WORKFLOW_START, f"boss_scan: keyword={keyword}, max_items={max_items}, max_pages={max_pages}")
@@ -1611,6 +1859,16 @@ def pull_boss_chat_conversations(
     fetch_jd: bool | None = None,
     chat_tab: str = "全部",
 ) -> tuple[list[BossChatConversationItem], str | None]:
+    if not _in_boss_sync_thread():
+        return _dispatch_to_boss_sync(
+            pull_boss_chat_conversations,
+            max_conversations=max_conversations,
+            unread_only=unread_only,
+            fetch_latest_hr=fetch_latest_hr,
+            fetch_jd=fetch_jd,
+            chat_tab=chat_tab,
+        )
+
     """拉取 BOSS 聊天会话列表。
 
     chat_tab: BOSS 内置标签过滤 —— "全部" | "未读" | "新招呼"。
@@ -1662,8 +1920,20 @@ def pull_boss_chat_conversations(
             fetch_jd=fetch_jd,
         )
     if unread_only:
-        items = [item for item in items if item.unread_count > 0]
-        emit(EventType.INFO, f"过滤后剩余 {len(items)} 个未读会话")
+        # 在「未读/新招呼」视图中，BOSS 可能只显示红点而不显示数字，
+        # 此时 unread_count 会被解析成 0。该场景下不再做二次数字过滤，避免漏会话。
+        if chat_tab in {"未读", "新招呼"}:
+            normalized: list[BossChatConversationItem] = []
+            for item in items:
+                if item.unread_count <= 0:
+                    normalized.append(item.model_copy(update={"unread_count": 1}))
+                else:
+                    normalized.append(item)
+            items = normalized
+            emit(EventType.INFO, f"[{chat_tab}] 视图跳过 unread_count 数字过滤，保留 {len(items)} 个会话")
+        else:
+            items = [item for item in items if item.unread_count > 0]
+            emit(EventType.INFO, f"过滤后剩余 {len(items)} 个未读会话")
 
     # 切回"全部"标签，避免影响后续操作
     if chat_tab and chat_tab != "全部":
@@ -1712,8 +1982,9 @@ def _send_selectors() -> list[str]:
 def _detect_and_click_resume_card(page: Any) -> tuple[str, str]:
     """检测聊天中 HR 索要简历的特殊卡片，并在可能时点击「同意」发送。
 
-    BOSS 直聘在 HR 请求简历时，会在消息流中插入一个卡片，卡片上有「同意」按钮。
-    点击后平台自动发送简历。若按钮已变灰/不可点击，说明简历已发送过。
+    BOSS 直聘在 HR 请求简历时有两种 UI 形式：
+      1) 消息流中的卡片 — 包含「同意」按钮
+      2) 底部浮动栏 — 同样有「拒绝」「同意」按钮
 
     Returns (status, detail):
         ("clicked", "...") — 成功点击了同意按钮
@@ -1723,40 +1994,89 @@ def _detect_and_click_resume_card(page: Any) -> tuple[str, str]:
     try:
         result = page.evaluate("""
             () => {
-                const chatArea = document.querySelector('.chat-conversation, .message-list, .chat-record, [class*="chat-msg"]') || document;
-                const allMsgItems = chatArea.querySelectorAll(
-                    '.item-myself, .item-other, .msg-item, .chat-msg-item, ' +
-                    '[class*="msg-card"], [class*="resume"], .message-item'
-                );
+                function checkDisabled(btn) {
+                    const styles = getComputedStyle(btn);
+                    return btn.disabled ||
+                        btn.hasAttribute('disabled') ||
+                        btn.classList.contains('disabled') ||
+                        btn.classList.contains('btn-disabled') ||
+                        btn.classList.contains('btn-has-done') ||
+                        styles.pointerEvents === 'none' ||
+                        parseFloat(styles.opacity) < 0.5;
+                }
 
-                for (const item of allMsgItems) {
-                    const text = (item.textContent || '');
-                    if (!(text.includes('简历') || text.includes('附件') || text.includes('resume')))
-                        continue;
-
-                    const btns = item.querySelectorAll('button, a, [role="button"], span[class*="btn"]');
+                function findAgreeBtn(container) {
+                    const btns = container.querySelectorAll(
+                        'button, a, [role="button"], span[class*="btn"], div[class*="btn"]'
+                    );
                     for (const btn of btns) {
                         const btnText = (btn.textContent || '').replace(/\\s+/g, '').trim();
                         if (btnText !== '同意' && !btnText.includes('同意'))
                             continue;
+                        if (btnText.includes('拒绝'))
+                            continue;
+                        return btn;
+                    }
+                    return null;
+                }
 
-                        const styles = getComputedStyle(btn);
-                        const disabled = btn.disabled ||
-                            btn.hasAttribute('disabled') ||
-                            btn.classList.contains('disabled') ||
-                            btn.classList.contains('btn-disabled') ||
-                            btn.classList.contains('btn-has-done') ||
-                            styles.pointerEvents === 'none' ||
-                            parseFloat(styles.opacity) < 0.5;
+                // ── 路径 1: 底部浮动栏（优先级最高，用户截图中明确可见） ──
+                const bottomBars = document.querySelectorAll(
+                    '[class*="resume-request"], [class*="attach-resume"], ' +
+                    '[class*="request-bar"], [class*="tip-wrap"], [class*="tip-bar"], ' +
+                    '.chat-input-area > div, .chat-conversation > div:last-child, ' +
+                    '[class*="bottom"] [class*="tip"], [class*="chat"] [class*="confirm"]'
+                );
+                for (const bar of bottomBars) {
+                    const text = (bar.textContent || '');
+                    if (!(text.includes('附件简历') || text.includes('是否同意')))
+                        continue;
+                    const btn = findAgreeBtn(bar);
+                    if (!btn) continue;
+                    if (checkDisabled(btn))
+                        return { status: 'already_sent', detail: '底部浮动栏简历请求已处理' };
+                    btn.click();
+                    return { status: 'clicked', detail: '已通过底部浮动栏点击同意' };
+                }
 
-                        if (disabled) {
-                            return { status: 'already_sent', detail: '简历请求卡片已处理(按钮不可用)' };
-                        }
+                // ── 路径 1b: 宽泛扫描整个页面找底部栏 ──
+                const allDivs = document.querySelectorAll('div');
+                for (const el of allDivs) {
+                    if (el.children.length > 20) continue;
+                    const text = (el.textContent || '');
+                    if (!(text.includes('附件简历') && text.includes('同意')))
+                        continue;
+                    if (text.includes('拒绝')) {
+                        const btn = findAgreeBtn(el);
+                        if (!btn) continue;
+                        if (checkDisabled(btn))
+                            return { status: 'already_sent', detail: '页面简历请求已处理' };
                         btn.click();
-                        return { status: 'clicked', detail: '已点击同意发送简历' };
+                        return { status: 'clicked', detail: '已通过页面元素点击同意' };
                     }
                 }
-                return { status: 'not_found', detail: '未找到简历请求卡片' };
+
+                // ── 路径 2: 消息流中的卡片 ──
+                const chatArea = document.querySelector(
+                    '.chat-conversation, .message-list, .chat-record, [class*="chat-msg"]'
+                ) || document;
+                const allMsgItems = chatArea.querySelectorAll(
+                    '.item-myself, .item-other, .msg-item, .chat-msg-item, ' +
+                    '[class*="msg-card"], [class*="resume"], .message-item'
+                );
+                for (const item of allMsgItems) {
+                    const text = (item.textContent || '');
+                    if (!(text.includes('简历') || text.includes('附件') || text.includes('resume')))
+                        continue;
+                    const btn = findAgreeBtn(item);
+                    if (!btn) continue;
+                    if (checkDisabled(btn))
+                        return { status: 'already_sent', detail: '消息卡片简历请求已处理(按钮不可用)' };
+                    btn.click();
+                    return { status: 'clicked', detail: '已通过消息卡片点击同意' };
+                }
+
+                return { status: 'not_found', detail: '未找到简历请求卡片或浮动栏' };
             }
         """)
     except Exception as exc:
@@ -1778,11 +2098,11 @@ def _detect_and_click_resume_card(page: Any) -> tuple[str, str]:
 def _try_send_resume(page: Any) -> tuple[bool, str | None]:
     """在已打开的聊天窗口中发送平台附件简历。
 
-    优先检测 HR 索要简历的特殊卡片（「同意」按钮），若未找到则走工具栏「发简历」按钮。
+    仅使用 BOSS 平台内置的简历发送机制：
+      - HR 发起简历请求卡片 → 点击「同意」
+      - 底部浮动栏简历请求 → 点击「同意」
 
-    BOSS 直聘的两种简历发送路径：
-      路径 A — HR 发起简历请求卡片 → 点击「同意」
-      路径 B — 工具栏「发简历」按钮 → 选择简历 → 确认
+    绝不触发工具栏「发简历」按钮（该按钮在部分场景下会弹出系统文件选择器）。
 
     Returns (成功, 错误信息).
     """
@@ -1793,118 +2113,9 @@ def _try_send_resume(page: Any) -> tuple[bool, str | None]:
     if card_status == "already_sent":
         emit(EventType.INFO, f"简历已通过卡片发送过: {card_detail}")
         return True, None
-    delay_min, delay_max = _action_delay_ms()
-    try:
-        resume_btn = None
-        for sel in [".toolbar-btn", ".chat-tool-bar .toolbar-btn-content", ".toolbar-btn-content"]:
-            try:
-                candidates = page.locator(sel)
-                for i in range(candidates.count()):
-                    el = candidates.nth(i)
-                    txt = (el.inner_text(timeout=2000) or "").strip()
-                    if "发简历" in txt or "发送简历" in txt:
-                        resume_btn = el
-                        break
-                if resume_btn:
-                    break
-            except Exception:
-                continue
 
-        if not resume_btn:
-            emit(EventType.WARNING, "未找到「发简历」按钮")
-            return False, "未找到「发简历」按钮"
-
-        btn_classes = ""
-        try:
-            btn_classes = resume_btn.evaluate("e => e.className || ''") or ""
-        except Exception:
-            pass
-        if "unable" in btn_classes.lower():
-            emit(EventType.WARNING, "「发简历」按钮不可用（HR 未回复），跳过")
-            return False, "HR 未回复，发简历按钮不可用"
-
-        resume_btn.click(timeout=5000)
-        emit(EventType.BROWSER_CLICK, "点击「发简历」按钮")
-        if delay_max > 0:
-            page.wait_for_timeout(random.randint(800, 1500))
-
-        resume_list = None
-        for list_sel in ["ul.resume-list", ".resume-list", ".resume-panel ul"]:
-            try:
-                loc = page.locator(list_sel)
-                if loc.count() > 0:
-                    resume_list = loc.first
-                    break
-            except Exception:
-                continue
-
-        if not resume_list:
-            page.wait_for_timeout(1500)
-            for list_sel in ["ul.resume-list", ".resume-list", ".resume-panel ul"]:
-                try:
-                    loc = page.locator(list_sel)
-                    if loc.count() > 0:
-                        resume_list = loc.first
-                        break
-                except Exception:
-                    continue
-
-        if not resume_list:
-            emit(EventType.WARNING, "简历列表未出现")
-            return False, "简历列表未出现"
-
-        resume_item = None
-        for item_sel in ["li.list-item", "li.resume-item", "li"]:
-            try:
-                items = resume_list.locator(item_sel)
-                if items.count() > 0:
-                    resume_item = items.first
-                    break
-            except Exception:
-                continue
-
-        if not resume_item:
-            emit(EventType.WARNING, "简历列表中没有可选简历")
-            return False, "简历列表为空"
-
-        resume_item.click(timeout=5000)
-        emit(EventType.BROWSER_CLICK, "选择第一份简历")
-        if delay_max > 0:
-            page.wait_for_timeout(random.randint(500, 1000))
-
-        confirm_btn = None
-        for confirm_sel in [
-            "button.btn-sure-v2",
-            "button.btn-confirm",
-            "button.btn-v2.btn-sure-v2",
-            "span.btn-sure-v2",
-            ".resume-panel button",
-        ]:
-            try:
-                loc = page.locator(confirm_sel)
-                if loc.count() > 0:
-                    el = loc.first
-                    if el.is_enabled(timeout=2000):
-                        confirm_btn = el
-                        break
-            except Exception:
-                continue
-
-        if not confirm_btn:
-            emit(EventType.WARNING, "未找到简历发送确认按钮")
-            return False, "未找到确认按钮"
-
-        confirm_btn.click(timeout=5000)
-        emit(EventType.BROWSER_CLICK, "点击确认发送简历")
-        if delay_max > 0:
-            page.wait_for_timeout(random.randint(800, 2000))
-        emit(EventType.REPLY_SENT, "平台附件简历已发送")
-        return True, None
-    except Exception as exc:
-        err = str(exc)[:300]
-        emit(EventType.ERROR, f"发送简历失败: {err}")
-        logger.warning("Send resume failed: %s", err)
-        return False, err
+    emit(EventType.INFO, "未检测到简历请求卡片/浮动栏，跳过简历发送（避免触发文件上传）")
+    return False, "未找到简历请求卡片，跳过发送（安全策略：不使用工具栏发简历按钮）"
 
 
 def _try_send_message(page: Any, text: str) -> tuple[bool, str | None]:
@@ -2015,6 +2226,14 @@ def execute_boss_chat_replies(
     resume_conversation_ids: list[str] | None = None,
     max_conversations: int = 30,
 ) -> list[tuple[str, bool, str | None]]:
+    if not _in_boss_sync_thread():
+        return _dispatch_to_boss_sync(
+            execute_boss_chat_replies,
+            items_to_send=items_to_send,
+            resume_conversation_ids=resume_conversation_ids,
+            max_conversations=max_conversations,
+        )
+
     """对指定会话实际发送回复和/或简历。
 
     使用 conversation_id 属性精确定位会话（而非列表索引），
@@ -2248,6 +2467,17 @@ def greet_matching_jobs(
     job_type: str = "all",
     run_id: str | None = None,
 ) -> dict[str, Any]:
+    if not _in_boss_sync_thread():
+        return _dispatch_to_boss_sync(
+            greet_matching_jobs,
+            keyword=keyword,
+            batch_size=batch_size,
+            match_threshold=match_threshold,
+            greeting_text=greeting_text,
+            job_type=job_type,
+            run_id=run_id,
+        )
+
     """涓流式主动打招呼：搜索岗位 → JD匹配 → 对匹配的岗位点击「立即沟通」。
 
     **核心保障：必须打满 batch_size 个招呼。**
@@ -2287,18 +2517,38 @@ def greet_matching_jobs(
         run_id, keyword, effective_batch, job_type, already_today, daily_limit, _min_daily_salary(),
     )
 
-    MAX_SEARCH_ROUNDS = 5
-    MAX_PAGES_PER_KEYWORD = 3
-
     fallback_keywords = _build_keyword_list(keyword, job_type)
+    search_multiplier = _greet_search_multiplier()
+    max_pages_per_keyword = _greet_max_pages_per_keyword()
+    force_fill_batch = _greet_force_fill_batch()
+    max_search_rounds = max(
+        effective_batch * search_multiplier,
+        len(fallback_keywords) * max_pages_per_keyword,
+    )
+    strict_rounds = max(5, min(max_search_rounds, effective_batch * max(2, search_multiplier // 2)))
+
     _glog.info("[GREET] 搜索关键词列表: %s", fallback_keywords)
+    _glog.info(
+        "[GREET] 搜索预算: rounds=%d strict_rounds=%d pages_per_keyword=%d search_multiplier=%d force_fill=%s",
+        max_search_rounds, strict_rounds, max_pages_per_keyword, search_multiplier, force_fill_batch,
+    )
+    decision_model_chain = _greet_decision_model_chain()
+    _glog.info("[GREET] 决策模型链路(greet_decision): %s", decision_model_chain)
 
     seen_urls: set[str] = set()
     greeted = 0
     failed = 0
     llm_rejected = 0
+    direction_rejected = 0
+    product_rejected = 0
+    non_ai_rejected = 0
+    salary_rejected = 0
+    relaxed_passed = 0
+    force_filled = 0
     detail_fail = 0
     greet_results: list[tuple[BossScanItem, bool, str]] = []
+    force_fill_pool: list[dict[str, Any]] = []
+    force_fill_urls: set[str] = set()
 
     context = _get_browser_context()
     page = _get_page(context)
@@ -2311,13 +2561,15 @@ def greet_matching_jobs(
         if greeted >= effective_batch:
             break
 
-        for page_num in range(1, MAX_PAGES_PER_KEYWORD + 1):
+        for page_num in range(1, max_pages_per_keyword + 1):
             if greeted >= effective_batch:
                 break
             round_num += 1
-            if round_num > MAX_SEARCH_ROUNDS:
-                _glog.info("[GREET] 达到最大搜索轮数 %d，停止", MAX_SEARCH_ROUNDS)
+            if round_num > max_search_rounds:
+                _glog.info("[GREET] 达到最大搜索轮数 %d，停止", max_search_rounds)
                 break
+
+            relaxed_mode = force_fill_batch and round_num > strict_rounds and greeted < effective_batch
 
             _glog.info("[GREET] 第 %d 轮: keyword=%r page=%d (greeted=%d/%d)",
                        round_num, current_kw, page_num, greeted, effective_batch)
@@ -2357,7 +2609,41 @@ def greet_matching_jobs(
                 if before - len(new_items) > 0:
                     _glog.info("[GREET] job_type过滤: %d → %d", before, len(new_items))
 
-            if _need_agent_direction_guard(current_kw):
+            # 产品岗硬过滤（不依赖 keyword/relaxed 模式，避免误打 AIAgent 产品经理等岗位）。
+            if new_items:
+                before = len(new_items)
+                passed_product: list[BossScanItem] = []
+                for item in new_items:
+                    if _is_product_track_role(item.title, item.snippet or ""):
+                        product_rejected += 1
+                        emit(EventType.WARNING, f"产品岗硬过滤排除: {item.title}@{item.company}")
+                        _glog.info("[GREET] 产品岗硬过滤: %s @ %s", item.title, item.company)
+                        _audit_greet_candidate(
+                            run_id=run_id,
+                            keyword=current_kw,
+                            round_num=round_num,
+                            page_num=page_num,
+                            item=item,
+                            stage="pre_filter_product",
+                            outcome="rejected",
+                            reason="hit_product_track_role",
+                            decision_model_chain=decision_model_chain,
+                            jd_text=item.snippet or "",
+                            extra={"source": "list_card"},
+                            glog=_glog,
+                        )
+                        continue
+                    passed_product.append(item)
+                new_items = passed_product
+                if before - len(new_items) > 0:
+                    _glog.info("[GREET] 产品岗过滤: %d → %d", before, len(new_items))
+
+            apply_direction_guard = _need_agent_direction_guard(current_kw) and not relaxed_mode
+            if _need_agent_direction_guard(current_kw) and relaxed_mode:
+                _glog.info("[GREET] 放宽阶段：跳过方向门控 keyword=%r page=%d", current_kw, page_num)
+                emit(EventType.INFO, f"放宽阶段：跳过方向门控 keyword={current_kw} page={page_num}")
+
+            if apply_direction_guard:
                 before = len(new_items)
                 passed_dir: list[BossScanItem] = []
                 for item in new_items:
@@ -2365,7 +2651,22 @@ def greet_matching_jobs(
                     if ok:
                         passed_dir.append(item)
                     else:
+                        direction_rejected += 1
                         emit(EventType.WARNING, f"方向过滤排除: {item.title}@{item.company} reason={reason}")
+                        _audit_greet_candidate(
+                            run_id=run_id,
+                            keyword=current_kw,
+                            round_num=round_num,
+                            page_num=page_num,
+                            item=item,
+                            stage="pre_filter_direction",
+                            outcome="rejected",
+                            reason=reason,
+                            decision_model_chain=decision_model_chain,
+                            jd_text=item.snippet or "",
+                            extra={"source": "list_card"},
+                            glog=_glog,
+                        )
                 new_items = passed_dir
                 if before - len(new_items) > 0:
                     _glog.info("[GREET] 方向门控过滤: %d → %d", before, len(new_items))
@@ -2402,6 +2703,30 @@ def greet_matching_jobs(
                     emit(EventType.WARNING, f"详情页JD提取失败或内容过短: {item.title}")
                     full_jd = item.snippet or ""
 
+                # 研发岗硬规则：若标题是工程开发岗但 JD 缺少 AI/Agent 研发信号，则直接拒绝。
+                if _is_non_ai_engineering_role(item.title, full_jd, item.snippet or ""):
+                    non_ai_rejected += 1
+                    reason = "non_ai_engineering_role"
+                    greet_results.append((item, False, reason))
+                    emit(EventType.WARNING, f"研发方向过滤排除(非AI): {item.title}@{item.company}")
+                    _glog.info("[GREET] 研发方向过滤(非AI): %s @ %s", item.title, item.company)
+                    _audit_greet_candidate(
+                        run_id=run_id,
+                        keyword=current_kw,
+                        round_num=round_num,
+                        page_num=page_num,
+                        item=item,
+                        stage="hard_guard_non_ai_engineering",
+                        outcome="rejected",
+                        reason=reason,
+                        decision_model_chain=decision_model_chain,
+                        jd_text=full_jd,
+                        extra={"source": "detail_page"},
+                        glog=_glog,
+                    )
+                    continue
+
+                daily_max_for_priority: float | None = None
                 if min_salary > 0:
                     salary_info = _extract_detail_salary_info(page)
                     if salary_info is None:
@@ -2413,6 +2738,7 @@ def greet_matching_jobs(
                         source = str(salary_info.get("source") or "-")
                         daily_min = salary_info.get("daily_min")
                         daily_max = salary_info.get("daily_max")
+                        daily_max_for_priority = float(daily_max) if daily_max is not None else None
 
                         if daily_max is None:
                             emit(EventType.WARNING, f"薪资解析失败: {item.title} | raw={raw_salary}，跳过薪资门槛")
@@ -2434,9 +2760,31 @@ def greet_matching_jobs(
                                     f"薪资不达标: 折算日薪上限 {_format_money(daily_max)}元/天 "
                                     f"< {min_salary}元/天 (raw={raw_salary})"
                                 )
+                                salary_rejected += 1
                                 greet_results.append((item, False, reason))
                                 emit(EventType.WARNING, f"薪资不达标: {item.title} | {reason}")
                                 _glog.info("[GREET] 薪资不达标: %s | %s", item.title, reason[:160])
+                                _audit_greet_candidate(
+                                    run_id=run_id,
+                                    keyword=current_kw,
+                                    round_num=round_num,
+                                    page_num=page_num,
+                                    item=item,
+                                    stage="salary_guard",
+                                    outcome="rejected",
+                                    reason=reason,
+                                    decision_model_chain=decision_model_chain,
+                                    jd_text=full_jd,
+                                    extra={
+                                        "source": "detail_page",
+                                        "salary_raw": raw_salary,
+                                        "salary_basis": basis,
+                                        "daily_min": daily_min,
+                                        "daily_max": daily_max,
+                                        "min_daily_salary": min_salary,
+                                    },
+                                    glog=_glog,
+                                )
                                 continue
                             emit(
                                 EventType.INFO,
@@ -2449,11 +2797,49 @@ def greet_matching_jobs(
                 decision = run_greet_decision(jd_context)
 
                 if not decision.should_greet:
-                    llm_rejected += 1
-                    greet_results.append((item, False, f"LLM拒绝: {decision.reason}"))
-                    emit(EventType.WARNING, f"LLM拒绝打招呼: {item.title}@{item.company} | reason={decision.reason}")
-                    _glog.info("[GREET] LLM拒绝: %s | %s", item.title, decision.reason[:80])
-                    continue
+                    relaxed_accept = relaxed_mode and _is_relaxed_target_candidate(
+                        item.title,
+                        full_jd or (item.snippet or ""),
+                        decision.reason or "",
+                    )
+                    if not relaxed_accept:
+                        llm_rejected += 1
+                        greet_results.append((item, False, f"LLM拒绝: {decision.reason}"))
+                        emit(EventType.WARNING, f"LLM拒绝打招呼: {item.title}@{item.company} | reason={decision.reason}")
+                        _glog.info("[GREET] LLM拒绝: %s | %s", item.title, decision.reason[:80])
+                        _audit_greet_candidate(
+                            run_id=run_id,
+                            keyword=current_kw,
+                            round_num=round_num,
+                            page_num=page_num,
+                            item=item,
+                            stage="llm_decision",
+                            outcome="rejected",
+                            reason=decision.reason or "llm_rejected",
+                            llm_confidence=str(getattr(decision, "confidence", "") or ""),
+                            decision_model_chain=decision_model_chain,
+                            jd_text=full_jd,
+                            extra={"source": "detail_page"},
+                            glog=_glog,
+                        )
+                        if force_fill_batch and item.source_url and item.source_url not in force_fill_urls:
+                            force_fill_pool.append(
+                                {
+                                    "item": item,
+                                    "reason": decision.reason or "",
+                                    "priority": _fallback_priority(
+                                        item.title,
+                                        full_jd or (item.snippet or ""),
+                                        decision.reason or "",
+                                        daily_max_for_priority,
+                                    ),
+                                }
+                            )
+                            force_fill_urls.add(item.source_url)
+                        continue
+                    relaxed_passed += 1
+                    emit(EventType.INFO, f"放宽通过: {item.title}@{item.company} | 原LLM拒绝但满足软匹配")
+                    _glog.info("[GREET] 放宽通过: %s | 原LLM拒绝原因=%s", item.title, (decision.reason or "")[:80])
 
                 emit(EventType.INFO, f"LLM通过: {item.title}@{item.company} | reason={decision.reason}")
                 _glog.info("[GREET] LLM通过: %s | %s", item.title, decision.reason[:80])
@@ -2494,11 +2880,41 @@ def greet_matching_jobs(
                         greet_results.append((item, False, "已沟通过"))
                         emit(EventType.INFO, f"已沟通过，跳过: {item.title}@{item.company}")
                         _glog.info("[GREET] 已沟通过: %s", item.title)
+                        _audit_greet_candidate(
+                            run_id=run_id,
+                            keyword=current_kw,
+                            round_num=round_num,
+                            page_num=page_num,
+                            item=item,
+                            stage="execute_greet",
+                            outcome="skipped",
+                            reason="already_chatted",
+                            llm_confidence=str(getattr(decision, "confidence", "") or ""),
+                            decision_model_chain=decision_model_chain,
+                            jd_text=full_jd,
+                            extra={"source": "detail_page", "llm_reason": decision.reason},
+                            glog=_glog,
+                        )
                     else:
                         failed += 1
                         greet_results.append((item, False, "未找到「立即沟通」按钮"))
                         emit(EventType.WARNING, f"未找到沟通按钮: {item.title}@{item.company}")
                         _glog.warning("[GREET] 未找到按钮: %s", item.title)
+                        _audit_greet_candidate(
+                            run_id=run_id,
+                            keyword=current_kw,
+                            round_num=round_num,
+                            page_num=page_num,
+                            item=item,
+                            stage="execute_greet",
+                            outcome="failed",
+                            reason="greet_button_not_found",
+                            llm_confidence=str(getattr(decision, "confidence", "") or ""),
+                            decision_model_chain=decision_model_chain,
+                            jd_text=full_jd,
+                            extra={"source": "detail_page", "llm_reason": decision.reason},
+                            glog=_glog,
+                        )
                     continue
 
                 try:
@@ -2512,12 +2928,32 @@ def greet_matching_jobs(
                     log_action(
                         job_id=None,
                         action_type="boss_greet",
-                        input_summary=f"keyword={current_kw}; title={item.title}; company={item.company}; url={item.source_url}; llm_reason={decision.reason}",
+                        input_summary=(
+                            f"keyword={current_kw}; title={item.title}; company={item.company}; url={item.source_url}; "
+                            f"llm_reason={decision.reason}; llm_conf={getattr(decision, 'confidence', '')}; "
+                            f"model_chain={','.join(decision_model_chain)}; "
+                            f"jd_excerpt={_compact_text(full_jd, 1000)}"
+                        ),
                         output_summary=f"greeted=true; daily_count={_greet_today_count()}/{daily_limit}",
                         status="success",
                     )
                     emit(EventType.REPLY_SENT, f"打招呼成功: {item.title}@{item.company} (今日第{_greet_today_count()}个)")
                     _glog.info("[GREET] ✓ 成功打招呼 #%d: %s @ %s", greeted, item.title, item.company)
+                    _audit_greet_candidate(
+                        run_id=run_id,
+                        keyword=current_kw,
+                        round_num=round_num,
+                        page_num=page_num,
+                        item=item,
+                        stage="execute_greet",
+                        outcome="success",
+                        reason=decision.reason or "llm_passed_and_clicked",
+                        llm_confidence=str(getattr(decision, "confidence", "") or ""),
+                        decision_model_chain=decision_model_chain,
+                        jd_text=full_jd,
+                        extra={"source": "detail_page", "llm_reason": decision.reason},
+                        glog=_glog,
+                    )
 
                 except Exception as exc:
                     failed += 1
@@ -2525,19 +2961,130 @@ def greet_matching_jobs(
                     log_action(
                         job_id=None,
                         action_type="boss_greet",
-                        input_summary=f"keyword={current_kw}; title={item.title}; company={item.company}; url={item.source_url}",
+                        input_summary=(
+                            f"keyword={current_kw}; title={item.title}; company={item.company}; url={item.source_url}; "
+                            f"llm_reason={decision.reason}; llm_conf={getattr(decision, 'confidence', '')}; "
+                            f"model_chain={','.join(decision_model_chain)}; "
+                            f"jd_excerpt={_compact_text(full_jd, 1000)}"
+                        ),
                         output_summary=f"greeted=false; error={exc}",
                         status="error",
                     )
                     emit(EventType.WARNING, f"打招呼失败: {item.title}@{item.company}: {exc}")
                     _glog.error("[GREET] 打招呼点击失败: %s → %s", item.title, str(exc)[:100])
+                    _audit_greet_candidate(
+                        run_id=run_id,
+                        keyword=current_kw,
+                        round_num=round_num,
+                        page_num=page_num,
+                        item=item,
+                        stage="execute_greet",
+                        outcome="failed",
+                        reason=str(exc)[:200],
+                        llm_confidence=str(getattr(decision, "confidence", "") or ""),
+                        decision_model_chain=decision_model_chain,
+                        jd_text=full_jd,
+                        extra={"source": "detail_page", "llm_reason": decision.reason},
+                        glog=_glog,
+                    )
 
                 wait_ms = random.randint(greet_delay_min, greet_delay_max)
                 emit(EventType.INFO, f"打招呼间隔等待 {wait_ms/1000:.1f}s...")
                 page.wait_for_timeout(wait_ms)
 
-        if round_num > MAX_SEARCH_ROUNDS:
+        if round_num > max_search_rounds:
             break
+
+    if force_fill_batch and greeted < effective_batch and force_fill_pool:
+        remaining_slots = effective_batch - greeted
+        emit(EventType.WARNING, f"严格筛选后仅打招呼 {greeted}/{effective_batch}，启动补齐策略（剩余 {remaining_slots}）")
+        _glog.warning(
+            "[GREET] 启动补齐策略: greeted=%d/%d pool=%d",
+            greeted, effective_batch, len(force_fill_pool),
+        )
+        ranked_pool = sorted(force_fill_pool, key=lambda x: float(x.get("priority", 0.0)), reverse=True)
+        for cand in ranked_pool:
+            if greeted >= effective_batch:
+                break
+            item = cand.get("item")
+            if not isinstance(item, BossScanItem) or not item.source_url:
+                continue
+            if _is_product_track_role(item.title, item.snippet or ""):
+                product_rejected += 1
+                greet_results.append((item, False, "补齐阶段命中产品岗硬过滤"))
+                _glog.info("[GREET] 补齐阶段拦截产品岗: %s @ %s", item.title, item.company)
+                _audit_greet_candidate(
+                    run_id=run_id,
+                    keyword=keyword,
+                    round_num=round_num,
+                    page_num=None,
+                    item=item,
+                    stage="force_fill",
+                    outcome="rejected",
+                    reason="hit_product_track_role",
+                    decision_model_chain=decision_model_chain,
+                    jd_text=item.snippet or "",
+                    extra={"source": "force_fill_pool"},
+                    glog=_glog,
+                )
+                continue
+            ok, detail = _click_greet_on_detail_page(page, item.source_url)
+            if not ok:
+                if detail == "cookie_expired":
+                    _handle_cookie_expired(page, "打招呼-补齐阶段")
+                    _glog.error("[GREET] 补齐阶段 Cookie 过期，中断")
+                    break
+                greet_results.append((item, False, f"补齐失败: {detail or 'unknown'}"))
+                _audit_greet_candidate(
+                    run_id=run_id,
+                    keyword=keyword,
+                    round_num=round_num,
+                    page_num=None,
+                    item=item,
+                    stage="force_fill",
+                    outcome="failed",
+                    reason=detail or "unknown",
+                    decision_model_chain=decision_model_chain,
+                    jd_text=item.snippet or "",
+                    extra={"source": "force_fill_pool"},
+                    glog=_glog,
+                )
+                continue
+
+            force_filled += 1
+            greeted += 1
+            note = str(cand.get("reason") or "")
+            greet_results.append((item, True, f"FORCE_FILL: {note}"))
+            log_action(
+                job_id=None,
+                action_type="boss_greet",
+                input_summary=(
+                    f"force_fill=true; title={item.title}; company={item.company}; "
+                    f"url={item.source_url}; llm_reject_reason={note}; "
+                    f"model_chain={','.join(decision_model_chain)}; "
+                    f"jd_excerpt={_compact_text(item.snippet or '', 1000)}"
+                ),
+                output_summary=f"greeted=true; daily_count={_greet_today_count()}/{daily_limit}",
+                status="success",
+            )
+            emit(EventType.REPLY_SENT, f"补齐打招呼成功: {item.title}@{item.company} (今日第{_greet_today_count()}个)")
+            _glog.warning("[GREET] ✓ 补齐成功 #%d: %s @ %s", greeted, item.title, item.company)
+            _audit_greet_candidate(
+                run_id=run_id,
+                keyword=keyword,
+                round_num=round_num,
+                page_num=None,
+                item=item,
+                stage="force_fill",
+                outcome="success",
+                reason=f"force_fill: {note}",
+                decision_model_chain=decision_model_chain,
+                jd_text=item.snippet or "",
+                extra={"source": "force_fill_pool"},
+                glog=_glog,
+            )
+            wait_ms = random.randint(greet_delay_min, greet_delay_max)
+            page.wait_for_timeout(wait_ms)
 
     skipped = len(seen_urls) - greeted - failed - llm_rejected - detail_fail
     if skipped < 0:
@@ -2547,23 +3094,47 @@ def greet_matching_jobs(
     reason = None
     if greeted >= effective_batch:
         reason = "batch_fulfilled"
-    elif round_num >= MAX_SEARCH_ROUNDS:
+    elif round_num >= max_search_rounds:
         reason = "max_rounds_exhausted"
     else:
         reason = "all_keywords_exhausted"
 
     _glog.info(
-        "[GREET][%s] === END === greeted=%d/%d failed=%d llm_rejected=%d detail_fail=%d reason=%s rounds=%d unique_jobs=%d",
-        run_id, greeted, effective_batch, failed, llm_rejected, detail_fail, reason, round_num, len(seen_urls),
+        "[GREET][%s] === END === greeted=%d/%d failed=%d llm_rejected=%d direction_rejected=%d product_rejected=%d non_ai_rejected=%d "
+        "salary_rejected=%d detail_fail=%d relaxed_passed=%d force_filled=%d reason=%s rounds=%d unique_jobs=%d",
+        run_id,
+        greeted,
+        effective_batch,
+        failed,
+        llm_rejected,
+        direction_rejected,
+        product_rejected,
+        non_ai_rejected,
+        salary_rejected,
+        detail_fail,
+        relaxed_passed,
+        force_filled,
+        reason,
+        round_num,
+        len(seen_urls),
     )
 
     emit(EventType.WORKFLOW_END,
          f"greet_matching_jobs 完成: greeted={greeted}/{effective_batch}, llm_rejected={llm_rejected}, "
+         f"direction_rejected={direction_rejected}, product_rejected={product_rejected}, non_ai_rejected={non_ai_rejected}, "
+         f"salary_rejected={salary_rejected}, "
+         f"relaxed_passed={relaxed_passed}, force_filled={force_filled}, "
          f"detail_fail={detail_fail}, failed={failed}, reason={reason}, rounds={round_num}")
     return {
         "greeted": greeted,
         "failed": failed,
         "llm_rejected": llm_rejected,
+        "direction_rejected": direction_rejected,
+        "product_rejected": product_rejected,
+        "non_ai_rejected": non_ai_rejected,
+        "salary_rejected": salary_rejected,
+        "relaxed_passed": relaxed_passed,
+        "force_filled": force_filled,
         "detail_fail": detail_fail,
         "skipped": skipped,
         "daily_count": _greet_today_count(),
@@ -2585,10 +3156,12 @@ def _build_keyword_list(primary_keyword: str, job_type: str) -> list[str]:
 
     variants = [
         f"AI Agent{suffix}",
-        f"大模型开发{suffix}",
-        f"LLM应用{suffix}",
-        f"NLP算法{suffix}",
-        f"AIGC{suffix}",
+        f"智能体开发{suffix}",
+        f"大模型应用开发{suffix}",
+        f"LLM应用开发{suffix}",
+        f"RAG工程{suffix}",
+        f"Agent工程化{suffix}",
+        f"AIGC应用{suffix}",
     ]
 
     for v in variants:

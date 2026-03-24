@@ -265,7 +265,11 @@ def _classify_node(state: EmailState) -> EmailState:
     ).invoke({"sender": sender, "subject": subject, "body": body})
 
     try:
-        parsed: _EmailParsed = _invoke_structured(prompt, _EmailParsed)
+        parsed: _EmailParsed = _invoke_structured(
+            prompt,
+            _EmailParsed,
+            route="email_classify",
+        )
         email_type = str(parsed.email_type or "").strip().lower()
         if email_type not in {"interview_invite", "rejection", "need_material", "irrelevant"}:
             raise ValueError(f"invalid email_type={email_type}")

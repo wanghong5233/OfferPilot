@@ -188,7 +188,11 @@ def generate_interview_prep(
     )
 
     try:
-        parsed: _InterviewPrepParsed = _invoke_structured(prompt, _InterviewPrepParsed)
+        parsed: _InterviewPrepParsed = _invoke_structured(
+            prompt,
+            _InterviewPrepParsed,
+            route="interview_prep",
+        )
         questions = [
             InterviewPrepQuestion(
                 question=item.question.strip(),

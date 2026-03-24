@@ -322,7 +322,11 @@ def classify_hr_message(message: str) -> tuple[str, float, str | None]:
     ).invoke({"message": message})
 
     try:
-        parsed: _HRMessageParsed = _invoke_structured(prompt, _HRMessageParsed)
+        parsed: _HRMessageParsed = _invoke_structured(
+            prompt,
+            _HRMessageParsed,
+            route="chat_classify",
+        )
         intent = str(parsed.intent or "").strip().lower()
         if intent not in _VALID_INTENTS:
             raise ValueError(f"invalid intent: {intent}")
@@ -400,7 +404,11 @@ def _plan_hr_reply(
         }
     )
     try:
-        parsed: _HRReplyPlanParsed = _invoke_structured(prompt, _HRReplyPlanParsed)
+        parsed: _HRReplyPlanParsed = _invoke_structured(
+            prompt,
+            _HRReplyPlanParsed,
+            route="chat_plan",
+        )
         action = parsed.action
         topic = str(parsed.policy_topic or "").strip()
         reason = str(parsed.reason or "").strip()
@@ -597,7 +605,11 @@ def generate_reply(
         }
     )
     try:
-        parsed: _LLMReplyParsed = _invoke_structured(prompt, _LLMReplyParsed)
+        parsed: _LLMReplyParsed = _invoke_structured(
+            prompt,
+            _LLMReplyParsed,
+            route="chat_reply",
+        )
         if not parsed.can_reply:
             return None
         text = str(parsed.reply_text or "").strip()

@@ -50,7 +50,11 @@ def generate_material_draft(
             "feedback": feedback or "None",
         }
     )
-    return _invoke_structured(prompt, MaterialDraft)
+    return _invoke_structured(
+        prompt,
+        MaterialDraft,
+        route="material_draft",
+    )
 
 
 def build_material_summary(draft: MaterialDraft) -> str:

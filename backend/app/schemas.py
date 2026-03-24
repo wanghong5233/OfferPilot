@@ -37,6 +37,9 @@ class JDMatchOutput(BaseModel):
     match_score: float = Field(..., ge=0, le=100, description="匹配度 0-100")
     should_apply: bool = Field(..., description="是否建议投递/打招呼")
     strengths: List[str] = Field(default_factory=list, description="候选人匹配优势，2-3 点")
+    gaps: List[str] = Field(default_factory=list, description="匹配差距，0-3 点")
+    gap_analysis: str = Field(default="", description="差距分析与建议，2-3 句话")
+    one_line_reason: str = Field(default="", description="一句话总结匹配结论")
 
 
 class GreetDecision(BaseModel):

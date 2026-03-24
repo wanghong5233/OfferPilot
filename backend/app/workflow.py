@@ -15,6 +15,40 @@ from .schemas import GreetDecision, JDAnalyzeResponse, JDMatchOutput
 logger = logging.getLogger(__name__)
 
 
+_MODEL_ROUTE_DEFAULTS: dict[str, tuple[str, str]] = {
+    # 全局默认：优先成本友好的 plus，失败再回退 max。
+    "default": ("qwen-plus", "qwen3-max"),
+    # JD 匹配与主动打招呼属于核心决策链路，保留 max 兜底。
+    "jd_analysis": ("qwen-plus", "qwen3-max"),
+    "greet_decision": ("qwen3-max", "qwen-plus"),
+    # 对话类默认保持稳态；若要更省钱可在 .env 单独将其切到 turbo。
+    "chat_classify": ("qwen-plus", "qwen3-max"),
+    "chat_plan": ("qwen-plus", "qwen3-max"),
+    "proactive_contact": ("qwen-plus", "qwen3-max"),
+    # 来源匹配会影响自动跟进，优先稳定性。
+    "source_fit": ("qwen-plus", "qwen3-max"),
+    # 生成回复面向真实 HR 对话，优先质量。
+    "chat_reply": ("qwen-plus", "qwen3-max"),
+    # 其他业务模块。
+    "email_classify": ("qwen-plus", "qwen3-max"),
+    "material_draft": ("qwen-plus", "qwen3-max"),
+    "company_intel": ("qwen-plus", "qwen3-max"),
+    "interview_prep": ("qwen-plus", "qwen3-max"),
+}
+
+
+def _route_env_prefix(route: str) -> str:
+    key = "".join(ch if ch.isalnum() else "_" for ch in str(route or "default").upper())
+    return f"MODEL_ROUTE_{key}"
+
+
+def _route_default_pair(route: str) -> tuple[str, str]:
+    return _MODEL_ROUTE_DEFAULTS.get(route, _MODEL_ROUTE_DEFAULTS["default"])
+
+
+def _dedupe_models(models: list[str]) -> list[str]:
+    return list(dict.fromkeys([m.strip() for m in models if isinstance(m, str) and m.strip()]))
+
 
 def _load_api_config() -> tuple[str, str]:
     """
@@ -56,12 +90,28 @@ def _load_api_config() -> tuple[str, str]:
     )
 
 
-def _candidate_models() -> list[str]:
-    primary = os.getenv("MODEL_PRIMARY", "qwen3-max")
-    fallback = os.getenv("MODEL_FALLBACK", "qwen-plus")
-    models = [primary, fallback]
-    # De-duplicate while preserving order.
-    return list(dict.fromkeys([m for m in models if m]))
+def _candidate_models(route: str = "default") -> list[str]:
+    route = str(route or "default").strip() or "default"
+    route_primary_default, route_fallback_default = _route_default_pair(route)
+
+    global_primary = os.getenv("MODEL_PRIMARY", _MODEL_ROUTE_DEFAULTS["default"][0])
+    global_fallback = os.getenv("MODEL_FALLBACK", _MODEL_ROUTE_DEFAULTS["default"][1])
+    prefix = _route_env_prefix(route)
+
+    primary = os.getenv(f"{prefix}_PRIMARY", route_primary_default or global_primary)
+    fallback = os.getenv(f"{prefix}_FALLBACK", route_fallback_default or global_fallback)
+
+    # 最终保证：route 配置 -> 全局配置 -> 内置默认
+    return _dedupe_models(
+        [
+            primary,
+            fallback,
+            global_primary,
+            global_fallback,
+            _MODEL_ROUTE_DEFAULTS["default"][0],
+            _MODEL_ROUTE_DEFAULTS["default"][1],
+        ]
+    )
 
 
 def _build_llm(model: str) -> ChatOpenAI:
@@ -76,16 +126,18 @@ def _build_llm(model: str) -> ChatOpenAI:
     )
 
 
-def _invoke_structured(prompt_value: Any, schema: type[Any]) -> Any:
+def _invoke_structured(prompt_value: Any, schema: type[Any], *, route: str = "default") -> Any:
     errors: list[str] = []
-    for model in _candidate_models():
+    for model in _candidate_models(route):
         try:
             llm = _build_llm(model).with_structured_output(schema)
             return llm.invoke(prompt_value)
         except Exception as exc:
             errors.append(f"{model}: {exc}")
             continue
-    raise RuntimeError("All models failed for structured output: " + " | ".join(errors))
+    raise RuntimeError(
+        f"All models failed for structured output (route={route}): " + " | ".join(errors)
+    )
 
 
 def _coerce_text(content: Any) -> str:
@@ -102,9 +154,9 @@ def _coerce_text(content: Any) -> str:
     return str(content)
 
 
-def _invoke_text(prompt_value: Any) -> str:
+def _invoke_text(prompt_value: Any, *, route: str = "default") -> str:
     errors: list[str] = []
-    for model in _candidate_models():
+    for model in _candidate_models(route):
         try:
             msg = _build_llm(model).invoke(prompt_value)
             if isinstance(msg, AIMessage):
@@ -113,7 +165,9 @@ def _invoke_text(prompt_value: Any) -> str:
         except Exception as exc:
             errors.append(f"{model}: {exc}")
             continue
-    raise RuntimeError("All models failed for text output: " + " | ".join(errors))
+    raise RuntimeError(
+        f"All models failed for text output (route={route}): " + " | ".join(errors)
+    )
 
 
 def _load_candidate_context() -> str:
@@ -222,7 +276,11 @@ def run_jd_analysis(jd_text: str) -> JDAnalyzeResponse:
         {"candidate_ctx": candidate_ctx, "jd_text": jd_text[:4000]}
     )
     try:
-        result: JDMatchOutput = _invoke_structured(prompt_value, JDMatchOutput)
+        result: JDMatchOutput = _invoke_structured(
+            prompt_value,
+            JDMatchOutput,
+            route="jd_analysis",
+        )
         score = max(0.0, min(100.0, float(result.match_score)))
         return JDAnalyzeResponse(
             title=result.title.strip() or "未知岗位",
@@ -230,10 +288,14 @@ def run_jd_analysis(jd_text: str) -> JDAnalyzeResponse:
             skills=[s.strip() for s in result.skills if s and s.strip()] or ["General"],
             match_score=round(score, 1),
             should_apply=result.should_apply,
-            strengths=result.strengths,
-            gaps=result.gaps,
-            gap_analysis=result.gap_analysis or result.one_line_reason,
-            one_line_reason=result.one_line_reason,
+            strengths=[s for s in (result.strengths or []) if isinstance(s, str) and s.strip()],
+            gaps=[g for g in (getattr(result, "gaps", []) or []) if isinstance(g, str) and g.strip()],
+            gap_analysis=(
+                str(getattr(result, "gap_analysis", "") or "").strip()
+                or str(getattr(result, "one_line_reason", "") or "").strip()
+                or "与候选人画像部分匹配，建议结合业务方向进一步确认。"
+            ),
+            one_line_reason=str(getattr(result, "one_line_reason", "") or "").strip(),
             resume_evidence=[],
         )
     except Exception as exc:
@@ -275,6 +337,7 @@ def _build_greet_decision_prompt() -> ChatPromptTemplate:
     reject_block = "\n".join(f"   - {r}" for r in reject_rules) if reject_rules else (
         "   - 岗位核心工作是模型预训练/后训练/RLHF/SFT/蒸馏，而非应用开发\n"
         "   - 岗位核心工作是传统算法（推荐/搜索/CV/NLP基础研究），而非LLM应用\n"
+        "   - 岗位核心职责偏产品（如产品经理/产品实习/需求分析/PRD输出），而非研发编码落地\n"
         "   - 岗位核心工作是测试/QA/运维，而非开发\n"
         "   - 岗位要求博士学历（候选人硕士）"
     )
@@ -318,7 +381,11 @@ def run_greet_decision(jd_text: str) -> GreetDecision:
         {"candidate_ctx": candidate_ctx, "jd_text": jd_text[:4000]}
     )
     try:
-        return _invoke_structured(prompt_value, GreetDecision)
+        return _invoke_structured(
+            prompt_value,
+            GreetDecision,
+            route="greet_decision",
+        )
     except Exception as exc:
         logger.warning("greet_decision LLM failed: %s", exc)
         return GreetDecision(should_greet=False, reason=f"LLM调用失败: {exc}", confidence="low")

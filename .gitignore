@@ -49,3 +49,9 @@ OpenClaw面试速查手册.md
 
 # Logs
 backend/logs/
+
+# Runtime exports (screenshots, generated materials - not source code)
+backend/exports/
+
+# Docs (generated separately)
+docs
