@@ -1,0 +1,29 @@
+{
+  "blocked_keywords": [
+    "rm -rf",
+    "drop database",
+    "delete all"
+  ],
+  "confirm_keywords": [
+    "deploy",
+    "production",
+    "payment",
+    "purchase",
+    "自动打招呼"
+  ],
+  "intent_policies": {
+    "boss.greet.trigger": {
+      "action": "confirm",
+      "reason": "主动打招呼属于外部动作，建议确认后执行。"
+    }
+  },
+  "rules": [
+    {
+      "name": "feishu_sensitive_chat",
+      "action": "confirm",
+      "reason": "来自飞书群聊的敏感动作默认走确认。",
+      "intents_any": ["boss.greet.trigger", "boss.chat.process"],
+      "metadata_keys": ["chat_id"]
+    }
+  ]
+}

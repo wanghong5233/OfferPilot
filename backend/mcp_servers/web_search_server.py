@@ -6,7 +6,7 @@ import urllib.request
 
 from fastmcp import FastMCP
 
-from app.web_search_service import search_web
+from pulse.core.tools.web_search import search_web
 
 _MCP = FastMCP("web-search")
 

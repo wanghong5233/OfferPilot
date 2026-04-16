@@ -27,7 +27,7 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-PROFILE_DIR="${BOSS_BROWSER_PROFILE_DIR:-$BACKEND_DIR/.playwright/boss}"
+PROFILE_DIR="${PULSE_BOSS_BROWSER_PROFILE_DIR:-${BOSS_BROWSER_PROFILE_DIR:-$PROJECT_DIR/.playwright/boss}}"
 if [[ "$PROFILE_DIR" != /* ]]; then
   PROFILE_DIR="$PROJECT_DIR/$PROFILE_DIR"
 fi

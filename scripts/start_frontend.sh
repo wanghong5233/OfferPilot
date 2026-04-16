@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 前端 watchdog：Next.js dev server 崩溃后自动重启
-# 用法: cd OfferPilot/frontend && bash ../scripts/start_frontend.sh
+# 用法: cd Pulse/frontend && bash ../scripts/start_frontend.sh
 
 set -e
 

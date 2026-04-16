@@ -1,0 +1,34 @@
+# Pulse MCP server registry (MCP-first).
+# Supports stdio plus HTTP-family transports:
+# - `http`: auto-detect streamable HTTP / legacy HTTP+SSE / custom gateway
+# - `streamable_http`: standard MCP Streamable HTTP endpoint
+# - `http_sse` / `sse`: legacy HTTP+SSE endpoint
+# Order matters: when PULSE_MCP_PREFERRED_SERVER is empty,
+# Pulse picks the first HTTP server in this list.
+
+servers:
+  - name: boss
+    transport: http
+    url: http://127.0.0.1:8811
+    timeout_sec: 10
+    auth_token_env: PULSE_BOSS_MCP_TOKEN
+
+  - name: web-search
+    transport: http
+    url: http://127.0.0.1:8812
+    timeout_sec: 8
+
+  # Example: stdio-based MCP servers (uncomment to enable)
+  # - name: filesystem
+  #   transport: stdio
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+  #   timeout_sec: 15
+
+  # - name: github
+  #   transport: stdio
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-github"]
+  #   env:
+  #     GITHUB_PERSONAL_ACCESS_TOKEN: ""
+  #   timeout_sec: 15

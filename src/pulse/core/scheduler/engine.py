@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Awaitable, Callable
+
+from .windows import is_active_hour, is_peak_hour
+
+TaskHandler = Callable[[], Awaitable[None] | None]
+
+
+@dataclass(slots=True)
+class ScheduleTask:
+    name: str
+    interval_seconds: int
+    handler: TaskHandler
+    enabled: bool = True
+    run_immediately: bool = False
+    peak_interval_seconds: int | None = None
+    offpeak_interval_seconds: int | None = None
+    active_hours_only: bool = False
+    active_start: int = 8
+    active_end: int = 23
+
+    def __post_init__(self) -> None:
+        if self.interval_seconds <= 0:
+            raise ValueError("interval_seconds must be greater than 0")
+
+    def effective_interval(self, *, now: datetime) -> int:
+        """Return interval adjusted for peak/off-peak hours."""
+        if self.peak_interval_seconds is not None and is_peak_hour(
+            now, peak_windows=[(9, 12), (14, 18)]
+        ):
+            return self.peak_interval_seconds
+        if self.offpeak_interval_seconds is not None and not is_peak_hour(
+            now, peak_windows=[(9, 12), (14, 18)]
+        ):
+            return self.offpeak_interval_seconds
+        return self.interval_seconds
+
+
+class SchedulerEngine:
+    """In-process interval scheduler with peak/off-peak time-awareness."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, ScheduleTask] = {}
+        self._last_run_at: dict[str, datetime] = {}
+
+    def register(self, task: ScheduleTask) -> None:
+        if task.name in self._tasks:
+            raise ValueError(f"task already exists: {task.name}")
+        self._tasks[task.name] = task
+
+    def list_tasks(self) -> list[str]:
+        return sorted(self._tasks.keys())
+
+    def is_due(self, task: ScheduleTask, *, now: datetime) -> bool:
+        if not task.enabled:
+            return False
+        if task.active_hours_only:
+            if not is_active_hour(
+                now,
+                weekday_start=task.active_start,
+                weekday_end=task.active_end,
+                weekend_start=task.active_start + 1,
+                weekend_end=task.active_end,
+            ):
+                return False
+        last = self._last_run_at.get(task.name)
+        if last is None:
+            return task.run_immediately
+        interval = task.effective_interval(now=now)
+        return now - last >= timedelta(seconds=interval)
+
+    async def run_pending(self, *, now: datetime | None = None) -> list[str]:
+        current = now or datetime.now(timezone.utc)
+        ran: list[str] = []
+        for task in self._tasks.values():
+            if not self.is_due(task, now=current):
+                continue
+            outcome = task.handler()
+            if inspect.isawaitable(outcome):
+                await outcome
+            self._last_run_at[task.name] = current
+            ran.append(task.name)
+        return ran
+
+    def mark_ran(self, task_name: str, *, when: datetime | None = None) -> None:
+        if task_name not in self._tasks:
+            raise KeyError(f"task not found: {task_name}")
+        self._last_run_at[task_name] = when or datetime.now(timezone.utc)
+
+    def status(self) -> list[dict[str, object]]:
+        now = datetime.now(timezone.utc)
+        result: list[dict[str, object]] = []
+        for task in self._tasks.values():
+            last = self._last_run_at.get(task.name)
+            result.append({
+                "name": task.name,
+                "enabled": task.enabled,
+                "interval": task.effective_interval(now=now),
+                "base_interval": task.interval_seconds,
+                "last_run": last.isoformat() if last else None,
+                "is_due": self.is_due(task, now=now),
+            })
+        return result

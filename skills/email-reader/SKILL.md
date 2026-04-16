@@ -65,7 +65,7 @@ Activate when user asks:
 - Heartbeat stop:
   - `curl -sS -X POST "http://127.0.0.1:8010/api/email/heartbeat/stop"`
 - Notify test:
-  - `curl -sS -X POST "http://127.0.0.1:8010/api/email/heartbeat/notify-test" -H "Content-Type: application/json" -d '{"message":"OfferPilot test"}'`
+  - `curl -sS -X POST "http://127.0.0.1:8010/api/email/heartbeat/notify-test" -H "Content-Type: application/json" -d '{"message":"Pulse test"}'`
 - Suggested OpenClaw cron message:
   - `Use email-reader skill to trigger one email heartbeat run, then summarize fetched_count, processed_count, interview invites, schedule_reminders, and notification status.`
 

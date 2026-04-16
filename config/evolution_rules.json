@@ -1,0 +1,20 @@
+{
+  "default_mode": "autonomous",
+  "change_modes": {
+    "prefs_update": "autonomous",
+    "soul_update": "supervised",
+    "belief_mutation": "autonomous"
+  },
+  "risk_mode_overrides": {
+    "critical": "gated"
+  },
+  "change_risk_mode_overrides": {
+    "soul_update": {
+      "high": "supervised",
+      "critical": "gated"
+    },
+    "prefs_update": {
+      "high": "gated"
+    }
+  }
+}

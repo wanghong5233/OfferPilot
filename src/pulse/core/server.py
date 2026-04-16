@@ -1,0 +1,2210 @@
+from __future__ import annotations
+
+import csv
+import inspect
+import io
+import json
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import Body, FastAPI, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
+
+from ..tools import register_builtin_tools
+from .brain import Brain
+from .channel import CliChannelAdapter, FeishuChannelAdapter, IncomingMessage, verify_feishu_signature
+from .config import get_settings
+from .cost import CostController
+from .evolution_config import build_evolution_governance_options
+from .events import EventBus, InMemoryEventStore
+from .learning import DPOCollector, PreferenceExtractor
+from .learning.behavior_analyzer import BehaviorAnalyzer
+from .llm.router import LLMRouter
+from .memory import ArchivalMemory, CoreMemory, RecallMemory, register_memory_tools
+from .memory.workspace_memory import WorkspaceMemory
+from .memory.correction_detector import CorrectionDetector
+from .mcp_client import MCPClient, MCPTransport
+from .mcp_server import DEFAULT_PROTOCOL_VERSION, MCPServerAdapter
+from .mcp_servers_config import load_mcp_servers, pick_preferred_http_server
+from .mcp_transport_http import HttpMCPTransport
+from .mcp_transport_stdio import StdioMCPTransport
+from .module import ModuleRegistry
+from .runtime import AgentRuntime, RuntimeConfig
+from .task_context import create_interactive_context
+from .prompt_contract import PromptContractBuilder
+from .hooks import HookContext, HookRegistry, HookResult, HookPoint
+from .compaction import CompactionEngine
+from .memory_reader import MemoryReaderAdapter
+from .promotion import PromotionEngine
+from .policy_config import build_policy_engine
+from .router_config import build_intent_router
+from .skill_generator import SkillGenerator
+from .storage.engine import DatabaseEngine
+from .storage.vector import LocalVectorStore
+from .soul import GovernanceRulesVersionStore, SoulEvolutionEngine, SoulGovernance
+from .tool import ToolRegistry
+
+
+def _build_configured_mcp_transport(settings: Any) -> MCPTransport | None:
+    """Build primary HTTP transport (backward compat). See _build_all_mcp_transports for multi-server."""
+    config_path = str(getattr(settings, "mcp_servers_config_path", "") or "").strip()
+    preferred_server = str(getattr(settings, "mcp_preferred_server", "") or "").strip()
+    configured_servers = load_mcp_servers(config_path)
+    chosen = pick_preferred_http_server(configured_servers, preferred_name=preferred_server)
+    if chosen is not None:
+        try:
+            return HttpMCPTransport(
+                base_url=chosen.url,
+                timeout_sec=chosen.timeout_sec,
+                auth_token=chosen.auth_token,
+                transport_mode=chosen.transport,
+            )
+        except Exception:
+            pass
+
+    base_url = str(getattr(settings, "mcp_http_base_url", "") or "").strip()
+    if not base_url:
+        return None
+    timeout_sec = float(getattr(settings, "mcp_http_timeout_sec", 8.0) or 8.0)
+    auth_token = str(getattr(settings, "mcp_http_auth_token", "") or "").strip()
+    try:
+        return HttpMCPTransport(
+            base_url=base_url,
+            timeout_sec=timeout_sec,
+            auth_token=auth_token,
+        )
+    except Exception:
+        return None
+
+
+def _build_all_mcp_transports(settings: Any) -> dict[str, MCPTransport]:
+    """Build transports for all configured MCP servers (http + stdio)."""
+    config_path = str(getattr(settings, "mcp_servers_config_path", "") or "").strip()
+    configured_servers = load_mcp_servers(config_path)
+    transports: dict[str, MCPTransport] = {}
+    for cfg in configured_servers:
+        try:
+            if cfg.transport == "stdio":
+                transports[cfg.name] = StdioMCPTransport(
+                    server_name=cfg.name,
+                    command=cfg.command,
+                    args=cfg.args,
+                    env=cfg.env,
+                    timeout_sec=cfg.timeout_sec,
+                )
+            elif cfg.transport in {"http", "streamable_http", "http_sse", "sse", "legacy_sse"} and cfg.url:
+                transports[cfg.name] = HttpMCPTransport(
+                    base_url=cfg.url,
+                    timeout_sec=cfg.timeout_sec,
+                    auth_token=cfg.auth_token,
+                    transport_mode=cfg.transport,
+                )
+        except Exception:
+            pass
+    return transports
+
+
+def create_app(
+    *,
+    llm_router_override: LLMRouter | None = None,
+    mcp_transport: MCPTransport | None = None,
+    skill_output_dir_override: str | None = None,
+) -> FastAPI:
+    settings = get_settings()
+    module_registry = ModuleRegistry()
+    module_registry.discover("pulse.modules")
+    llm_router = llm_router_override or LLMRouter()
+    intent_router = build_intent_router(
+        llm_router=llm_router,
+        config_path=settings.router_rules_path,
+        fallback_intent="general.default",
+        fallback_target="hello",
+    )
+    policy_engine = build_policy_engine(
+        config_path=settings.policy_rules_path,
+        blocked_keywords_env=settings.policy_blocked_keywords,
+        confirm_keywords_env=settings.policy_confirm_keywords,
+    )
+    policy_engine.set_intent_policy(
+        "skill.activate",
+        action="confirm",
+        reason="generated skill activation requires explicit confirmation",
+    )
+    policy_engine.set_intent_policy(
+        "mcp.external.call",
+        action="confirm",
+        reason="external MCP call requires explicit confirmation on first use",
+    )
+    core_memory = CoreMemory(
+        storage_path=settings.core_memory_path,
+        soul_config_path=settings.soul_config_path,
+    )
+    storage_engine = DatabaseEngine()
+    vector_store = LocalVectorStore()
+    recall_memory = RecallMemory(
+        collection_name=settings.recall_collection_name,
+        db_engine=storage_engine,
+        vector_store=vector_store,
+    )
+    archival_memory = ArchivalMemory(
+        collection_name=settings.archival_collection_name,
+        db_engine=storage_engine,
+        vector_store=vector_store,
+    )
+    workspace_memory = WorkspaceMemory(db_engine=storage_engine)
+
+    def _governance_overrides_from_env() -> tuple[str | None, dict[str, str]]:
+        default_mode_override = (
+            settings.evolution_default_mode if os.getenv("PULSE_EVOLUTION_DEFAULT_MODE", "").strip() else None
+        )
+        change_mode_overrides: dict[str, str] = {}
+        if os.getenv("PULSE_EVOLUTION_PREFS_MODE", "").strip():
+            change_mode_overrides["prefs_update"] = settings.evolution_prefs_mode
+        if os.getenv("PULSE_EVOLUTION_SOUL_MODE", "").strip():
+            change_mode_overrides["soul_update"] = settings.evolution_soul_mode
+        if os.getenv("PULSE_EVOLUTION_BELIEF_MODE", "").strip():
+            change_mode_overrides["belief_mutation"] = settings.evolution_belief_mode
+        return default_mode_override, change_mode_overrides
+
+    def _load_governance_options() -> dict[str, Any]:
+        default_override, change_overrides = _governance_overrides_from_env()
+        return build_evolution_governance_options(
+            config_path=settings.evolution_rules_path,
+            default_mode_override=default_override,
+            change_mode_overrides=change_overrides,
+        )
+
+    governance_options = _load_governance_options()
+    resolved_rules_path = str(governance_options.get("resolved_path") or settings.evolution_rules_path)
+    governance = SoulGovernance(
+        core_memory=core_memory,
+        audit_path=settings.governance_audit_path,
+        default_mode=str(governance_options.get("default_mode") or "autonomous"),
+        change_modes=dict(governance_options.get("change_modes") or {}),
+        risk_mode_overrides=dict(governance_options.get("risk_mode_overrides") or {}),
+        change_risk_mode_overrides=dict(governance_options.get("change_risk_mode_overrides") or {}),
+    )
+    rules_version_store = GovernanceRulesVersionStore(storage_path=settings.governance_rules_versions_path)
+    rules_version_store.record(
+        rules=governance.mode_status(),
+        source="startup_load",
+        actor="system",
+        metadata={"loaded_from": resolved_rules_path},
+    )
+    dpo_collector = DPOCollector(db_engine=storage_engine)
+    preference_extractor = PreferenceExtractor(llm_router=llm_router)
+    evolution_engine = SoulEvolutionEngine(
+        governance=governance,
+        archival_memory=archival_memory,
+        preference_extractor=preference_extractor,
+        dpo_collector=dpo_collector,
+        dpo_auto_collect=False,
+    )
+    tool_registry = ToolRegistry()
+    register_builtin_tools(tool_registry)
+    register_memory_tools(
+        tool_registry,
+        core_memory=core_memory,
+        recall_memory=recall_memory,
+        archival_memory=archival_memory,
+    )
+    for module_tool in module_registry.as_tools():
+        tool_registry.register(
+            name=str(module_tool["name"]),
+            handler=module_tool["handler"],  # type: ignore[arg-type]
+            description=str(module_tool["description"]),
+            ring=str(module_tool.get("ring") or "ring2_module"),  # type: ignore[arg-type]
+            metadata=dict(module_tool.get("metadata") or {}),
+        )
+    skill_generator = SkillGenerator(
+        tool_registry=tool_registry,
+        output_dir=skill_output_dir_override or settings.generated_skills_dir,
+        llm_router=llm_router,
+    )
+    cost_controller = CostController(daily_budget_usd=settings.brain_daily_budget_usd)
+    active_mcp_transport = mcp_transport or _build_configured_mcp_transport(settings)
+    all_transports = _build_all_mcp_transports(settings)
+    mcp_client = MCPClient(transport=active_mcp_transport, transports=all_transports)
+    approved_external_mcp_tools: set[str] = set()
+    external_mcp_aliases: dict[str, tuple[str, str]] = {}
+
+    def _slug_segment(value: str, *, fallback: str) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return fallback
+        chars: list[str] = []
+        for ch in raw:
+            if ch.isalnum() or ch in {".", "_", "-"}:
+                chars.append(ch)
+            else:
+                chars.append("_")
+        joined = "".join(chars).strip("._-")
+        while "__" in joined:
+            joined = joined.replace("__", "_")
+        return joined or fallback
+
+    def _external_tool_alias(server: str, name: str) -> str:
+        server_seg = _slug_segment(server, fallback="external")
+        name_seg = _slug_segment(name, fallback="tool")
+        return f"mcp.{server_seg}.{name_seg}"
+
+    def _approval_key(server: str, name: str) -> str:
+        return f"{server.strip().lower()}::{name.strip().lower()}"
+
+    def _external_tool_schema(schema: dict[str, Any] | None) -> dict[str, Any]:
+        safe_schema = dict(schema or {})
+        if str(safe_schema.get("type") or "").strip() != "object":
+            safe_schema["type"] = "object"
+        props_raw = safe_schema.get("properties")
+        safe_props = dict(props_raw) if isinstance(props_raw, dict) else {}
+        safe_props["_confirm"] = {
+            "type": "boolean",
+            "description": "Set true to confirm first-time external MCP call.",
+        }
+        safe_schema["properties"] = safe_props
+        return safe_schema
+
+    def _register_external_mcp_tools() -> list[dict[str, Any]]:
+        discovered: list[dict[str, Any]] = []
+        for item in mcp_client.list_tools():
+            alias = _external_tool_alias(item.server, item.name)
+            external_mcp_aliases[alias] = (item.server, item.name)
+            discovered.append(
+                {
+                    "alias": alias,
+                    "server": item.server,
+                    "name": item.name,
+                    "description": item.description,
+                    "schema": item.schema,
+                }
+            )
+            if tool_registry.get(alias) is not None:
+                continue
+
+            async def _handler(
+                args: dict[str, Any],
+                *,
+                _server: str = item.server,
+                _name: str = item.name,
+                _alias: str = alias,
+            ) -> dict[str, Any]:
+                payload = dict(args or {})
+                confirm = bool(payload.pop("_confirm", False))
+                try:
+                    payload_preview = json.dumps(payload, ensure_ascii=False)
+                except Exception:
+                    payload_preview = str(payload)
+                policy = policy_engine.evaluate(
+                    intent="mcp.external.call",
+                    text=f"{_server}.{_name} {payload_preview}",
+                    metadata={
+                        "server": _server,
+                        "name": _name,
+                        "alias": _alias,
+                        "arguments": payload,
+                    },
+                )
+                if policy.action == "blocked":
+                    return {
+                        "ok": False,
+                        "blocked": True,
+                        "server": _server,
+                        "name": _name,
+                        "policy": {
+                            "action": policy.action,
+                            "reason": policy.reason,
+                            "matched_rule": policy.matched_rule,
+                        },
+                    }
+                approval_key = _approval_key(_server, _name)
+                if policy.action == "confirm" and not confirm and approval_key not in approved_external_mcp_tools:
+                    return {
+                        "ok": False,
+                        "needs_confirmation": True,
+                        "server": _server,
+                        "name": _name,
+                        "policy": {
+                            "action": policy.action,
+                            "reason": policy.reason,
+                            "matched_rule": policy.matched_rule,
+                        },
+                    }
+                result = await mcp_client.call_tool(server=_server, name=_name, arguments=payload)
+                approved_external_mcp_tools.add(approval_key)
+                return {
+                    "ok": True,
+                    "server": _server,
+                    "name": _name,
+                    "result": result,
+                }
+
+            tool_registry.register(
+                name=alias,
+                handler=_handler,
+                description=f"[{item.server}] {item.description or item.name}",
+                ring="ring3_mcp",
+                schema=_external_tool_schema(item.schema),
+                metadata={
+                    "external": True,
+                    "server": item.server,
+                    "external_name": item.name,
+                },
+            )
+        return discovered
+
+    _register_external_mcp_tools()
+    correction_detector = CorrectionDetector(
+        llm_router=llm_router,
+        dpo_collector=dpo_collector,
+        recall_memory=recall_memory,
+        core_memory=core_memory,
+        governance=governance,
+    )
+    behavior_analyzer = BehaviorAnalyzer(
+        llm_router=llm_router,
+        recall_memory=recall_memory,
+    )
+    # -- P1+P2: PromptContract + Hook + Compaction + Promotion --
+    memory_reader = MemoryReaderAdapter(
+        core_memory=core_memory,
+        recall_memory=recall_memory,
+        archival_memory=archival_memory,
+        workspace_memory=workspace_memory,
+    )
+    tool_names = [t.name for t in tool_registry.list_tools()]
+    prompt_builder = PromptContractBuilder(memory=memory_reader, tool_names=tool_names)
+    hooks = HookRegistry()
+
+    def _policy_before_task(hctx: HookContext) -> HookResult:
+        payload = dict(hctx.payload or {})
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            return HookResult()
+        metadata = dict(hctx.ctx.extra or {})
+        route_hint = payload.get("route_hint") or metadata.get("route_hint")
+        if isinstance(route_hint, dict):
+            metadata["route_hint"] = route_hint
+        intent = str(metadata.get("intent") or "brain.run").strip() or "brain.run"
+        decision = policy_engine.evaluate(intent=intent, text=query, metadata=metadata)
+        if decision.action == "blocked":
+            return HookResult(block=True, reason=decision.reason)
+        if decision.action == "confirm":
+            return HookResult(block=True, reason=f"confirmation required: {decision.reason}")
+        return HookResult(injected={"policy_action": decision.action, "policy_reason": decision.reason})
+
+    def _policy_before_tool(hctx: HookContext) -> HookResult:
+        payload = dict(hctx.payload or {})
+        tool_name = str(payload.get("tool_name") or "").strip()
+        tool_args = payload.get("tool_args") or {}
+        if not tool_name:
+            return HookResult()
+        try:
+            tool_args_text = json.dumps(tool_args, ensure_ascii=False)
+        except Exception:
+            tool_args_text = str(tool_args)
+        decision = policy_engine.evaluate(
+            intent=f"tool.{tool_name}",
+            text=f"{tool_name} {tool_args_text}",
+            metadata={
+                **dict(hctx.ctx.extra or {}),
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "task_id": hctx.ctx.task_id,
+                "workspace_id": hctx.ctx.workspace_id,
+            },
+        )
+        if decision.action == "blocked":
+            return HookResult(block=True, reason=decision.reason)
+        if decision.action == "confirm":
+            return HookResult(block=True, reason=f"confirmation required: {decision.reason}")
+        return HookResult(injected={"policy_action": decision.action, "policy_reason": decision.reason})
+
+    def _governance_before_promotion(hctx: HookContext) -> HookResult:
+        payload = dict(hctx.payload or {})
+        risk_level = str(payload.get("risk") or "medium")
+        assessment = governance.assess_change(
+            change_type="promotion_fact",
+            risk_level=risk_level,
+            source="promotion_hook",
+            actor="promotion_engine",
+            payload={
+                "subject": payload.get("subject"),
+                "predicate": payload.get("predicate"),
+                "object": payload.get("object"),
+                "confidence": payload.get("confidence"),
+                "workspace_id": hctx.ctx.workspace_id,
+                "task_id": hctx.ctx.task_id,
+            },
+            reason="promotion candidate requires governance assessment",
+        )
+        if not assessment.get("ok"):
+            return HookResult(block=True, reason=str(assessment.get("reason") or "blocked by governance"))
+        return HookResult(injected={"governance_change_id": assessment.get("change_id")})
+
+    hooks.register(HookPoint.before_task_start, _policy_before_task, name="policy.before_task", priority=20)
+    hooks.register(HookPoint.before_tool_use, _policy_before_tool, name="policy.before_tool", priority=20)
+    hooks.register(HookPoint.before_promotion, _governance_before_promotion, name="governance.before_promotion", priority=20)
+
+    compaction = CompactionEngine()
+
+    promotion = PromotionEngine(
+        hooks=hooks,
+        archival_memory=archival_memory,
+        core_memory=core_memory,
+    )
+
+    brain = Brain(
+        tool_registry=tool_registry,
+        llm_router=llm_router,
+        cost_controller=cost_controller,
+        max_steps=settings.brain_max_steps,
+        core_memory=core_memory,
+        recall_memory=recall_memory,
+        archival_memory=archival_memory,
+        workspace_memory=workspace_memory,
+        memory_recent_limit=settings.memory_recent_limit,
+        evolution_engine=evolution_engine,
+        correction_detector=correction_detector,
+        prompt_builder=prompt_builder,
+        hooks=hooks,
+        compaction=compaction,
+        promotion=promotion,
+    )
+    mcp_server = MCPServerAdapter(tool_registry=tool_registry)
+    mcp_sessions: dict[str, dict[str, Any]] = {}
+    module_map = {module.name: module for module in module_registry.modules}
+    feedback_loop_module = module_map.get("feedback_loop")
+    if feedback_loop_module is not None and hasattr(feedback_loop_module, "bind_evolution_engine"):
+        feedback_loop_module.bind_evolution_engine(evolution_engine)  # type: ignore[attr-defined]
+    channel_adapters = {
+        "cli": CliChannelAdapter(),
+        "feishu": FeishuChannelAdapter(),
+    }
+    event_bus = EventBus()
+    event_store = InMemoryEventStore(max_events=settings.event_store_max_events)
+    event_bus.subscribe_all(event_store.record)
+    module_registry.bind_event_emitter(event_bus.publish)
+
+    def _preview(value: Any, *, max_chars: int = 300) -> str:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False)
+            except Exception:
+                text = str(value)
+        text = text.strip()
+        if len(text) > max_chars:
+            return text[:max_chars] + "...(truncated)"
+        return text
+
+    def _emit_event(event_type: str, payload: dict[str, Any]) -> None:
+        event_bus.publish(event_type, payload)
+
+    def _format_sse_event(row: dict[str, Any]) -> str:
+        return (
+            f"id: {row.get('event_id')}\n"
+            f"event: {row.get('event_type')}\n"
+            f"data: {json.dumps(row, ensure_ascii=False)}\n\n"
+        )
+
+    def _mcp_response_headers(*, session_id: str = "") -> dict[str, str]:
+        headers = {
+            "MCP-Protocol-Version": DEFAULT_PROTOCOL_VERSION,
+            "Cache-Control": "no-store",
+        }
+        safe_session = str(session_id or "").strip()
+        if safe_session:
+            headers["Mcp-Session-Id"] = safe_session
+        return headers
+
+    def _mcp_lookup_session(request: Request) -> tuple[str, dict[str, Any] | None]:
+        session_id = str(request.headers.get("mcp-session-id") or "").strip()
+        if not session_id:
+            return "", None
+        return session_id, mcp_sessions.get(session_id)
+
+    async def _dispatch_channel_message(message: IncomingMessage) -> dict[str, Any]:
+        metadata = dict(message.metadata)
+        metadata["channel"] = message.channel
+        metadata["user_id"] = message.user_id
+        if not str(metadata.get("session_id") or "").strip():
+            metadata["session_id"] = f"{message.channel}:{message.user_id}"
+
+        ctx = create_interactive_context(
+            session_id=str(metadata.get("session_id") or ""),
+            extra={"channel": message.channel, "user_id": message.user_id},
+        )
+        trace_id = ctx.trace_id
+        started_at = time.perf_counter()
+        _emit_event(
+            "channel.message.received",
+            {
+                "trace_id": trace_id,
+                "channel": message.channel,
+                "user_id": message.user_id,
+                "text_preview": _preview(message.text, max_chars=220),
+            },
+        )
+        route = intent_router.resolve(message.text)
+        policy = policy_engine.evaluate(
+            intent=route.intent,
+            text=message.text,
+            metadata=metadata,
+        )
+        response: dict[str, Any] = {
+            "channel": message.channel,
+            "user_id": message.user_id,
+            "text": message.text,
+            "route": {
+                "intent": route.intent,
+                "target": route.target,
+                "method": route.method,
+                "confidence": route.confidence,
+                "reason": route.reason,
+            },
+            "policy": {
+                "action": policy.action,
+                "reason": policy.reason,
+                "matched_rule": policy.matched_rule,
+            },
+            "trace_id": trace_id,
+        }
+        _emit_event(
+            "channel.message.routed",
+            {
+                "trace_id": trace_id,
+                "channel": message.channel,
+                "intent": route.intent,
+                "target": route.target,
+                "policy_action": policy.action,
+                "policy_reason": policy.reason,
+            },
+        )
+        if policy.action != "safe":
+            response["handled"] = False
+            response["result"] = None
+            response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "channel.message.blocked",
+                {
+                    "trace_id": trace_id,
+                    "channel": message.channel,
+                    "intent": route.intent,
+                    "target": route.target,
+                    "policy_action": policy.action,
+                    "policy_reason": policy.reason,
+                    "latency_ms": response["latency_ms"],
+                },
+            )
+            return response
+
+        target_name = str(route.target or "").strip().lower()
+        if target_name and target_name not in module_map:
+            response["handled"] = False
+            response["result"] = None
+            response["error"] = f"target module not found: {target_name or '-'}"
+            response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "channel.message.error",
+                {
+                    "trace_id": trace_id,
+                    "channel": message.channel,
+                    "intent": route.intent,
+                    "target": target_name,
+                    "error": response["error"],
+                    "latency_ms": response["latency_ms"],
+                },
+            )
+            return response
+
+        metadata["intent"] = route.intent
+        if target_name:
+            metadata["route_hint"] = {
+                "intent": route.intent,
+                "target": target_name,
+                "tool_name": f"module.{target_name}",
+            }
+        prefer_llm = settings.brain_prefer_llm
+        prefer_llm_raw = metadata.pop("prefer_llm", None)
+        if isinstance(prefer_llm_raw, bool):
+            prefer_llm = prefer_llm_raw
+        max_steps_raw = metadata.pop("max_steps", None)
+        max_steps: int | None = None
+        if isinstance(max_steps_raw, int):
+            max_steps = max_steps_raw
+        elif isinstance(max_steps_raw, str) and max_steps_raw.strip().isdigit():
+            max_steps = int(max_steps_raw.strip())
+        _emit_event(
+            "brain.run.started",
+            {
+                "trace_id": trace_id,
+                "source": "channel",
+                "channel": message.channel,
+                "query_preview": _preview(message.text, max_chars=220),
+                "prefer_llm": bool(prefer_llm),
+                "max_steps": max_steps,
+            },
+        )
+        try:
+            brain_result = await brain.run(
+                query=message.text,
+                ctx=ctx,
+                metadata=metadata,
+                max_steps=max_steps,
+                prefer_llm=prefer_llm,
+            )
+        except Exception as exc:
+            response["handled"] = False
+            response["result"] = None
+            response["error"] = str(exc)[:500]
+            response["mode"] = "brain"
+            response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "brain.run.failed",
+                {
+                    "trace_id": trace_id,
+                    "source": "channel",
+                    "channel": message.channel,
+                    "error": response["error"],
+                    "latency_ms": response["latency_ms"],
+                },
+            )
+            return response
+
+        route_tool = f"module.{target_name}" if target_name else ""
+        module_result: Any = None
+        if route_tool:
+            for step in reversed(brain_result.steps):
+                if step.action == "use_tool" and step.tool_name == route_tool:
+                    module_result = step.observation
+                    break
+
+        response["handled"] = bool(brain_result.answer or brain_result.used_tools)
+        response["mode"] = "brain"
+        response["brain"] = brain_result.to_dict()
+        if module_result is not None:
+            response["result"] = module_result
+        else:
+            response["result"] = {
+                "answer": brain_result.answer,
+                "used_tools": list(brain_result.used_tools),
+                "stopped_reason": brain_result.stopped_reason,
+            }
+        response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
+        _emit_event(
+            "brain.run.completed",
+            {
+                "trace_id": trace_id,
+                "source": "channel",
+                "channel": message.channel,
+                "used_tools": list(brain_result.used_tools),
+                "stopped_reason": brain_result.stopped_reason,
+                "steps_total": len(brain_result.steps),
+                "latency_ms": response["latency_ms"],
+            },
+        )
+        for step in brain_result.steps:
+            _emit_event(
+                "brain.step",
+                {
+                    "trace_id": trace_id,
+                    "source": "channel",
+                    "channel": message.channel,
+                    "index": int(step.index),
+                    "action": step.action,
+                    "tool_name": step.tool_name,
+                    "tool_args": dict(step.tool_args or {}),
+                    "observation_preview": _preview(step.observation, max_chars=240),
+                },
+            )
+            if step.action == "use_tool" and step.tool_name:
+                _emit_event(
+                    "brain.tool.invoked",
+                    {
+                        "trace_id": trace_id,
+                        "source": "channel",
+                        "channel": message.channel,
+                        "tool_name": step.tool_name,
+                        "tool_args": dict(step.tool_args or {}),
+                        "observation_preview": _preview(step.observation, max_chars=240),
+                    },
+                )
+        _emit_event(
+            "channel.message.completed",
+            {
+                "trace_id": trace_id,
+                "channel": message.channel,
+                "handled": bool(response.get("handled")),
+                "latency_ms": response["latency_ms"],
+            },
+        )
+        return response
+
+    for adapter in channel_adapters.values():
+        adapter.set_handler(_dispatch_channel_message)
+
+    runtime_config = RuntimeConfig()
+    agent_runtime = AgentRuntime(
+        event_emitter=event_bus.publish if event_bus else None,
+        config=runtime_config,
+        hooks=hooks,
+        compaction_engine=compaction,
+        promotion_engine=promotion,
+        recall_memory=recall_memory,
+        workspace_memory=workspace_memory,
+    )
+
+    for module in module_registry.modules:
+        module.bind_runtime(agent_runtime)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):  # noqa: ANN202
+        for module in module_registry.modules:
+            startup_result = module.on_startup()
+            if inspect.isawaitable(startup_result):
+                await startup_result
+        agent_runtime.start()
+        try:
+            yield
+        finally:
+            agent_runtime.stop()
+            for module in reversed(module_registry.modules):
+                shutdown_result = module.on_shutdown()
+                if inspect.isawaitable(shutdown_result):
+                    await shutdown_result
+
+    app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+    app.state.settings = settings
+    app.state.event_bus = event_bus
+    app.state.event_store = event_store
+    app.state.module_registry = module_registry
+    app.state.intent_router = intent_router
+    app.state.policy_engine = policy_engine
+    app.state.channel_adapters = channel_adapters
+    app.state.dispatch_channel_message = _dispatch_channel_message
+    app.state.tool_registry = tool_registry
+    app.state.cost_controller = cost_controller
+    app.state.brain = brain
+    app.state.core_memory = core_memory
+    app.state.recall_memory = recall_memory
+    app.state.archival_memory = archival_memory
+    app.state.workspace_memory = workspace_memory
+    app.state.governance = governance
+    app.state.evolution_rules = governance_options
+    app.state.governance_rules_versions = rules_version_store
+    app.state.evolution_engine = evolution_engine
+    app.state.dpo_collector = dpo_collector
+    app.state.skill_generator = skill_generator
+    app.state.mcp_client = mcp_client
+    app.state.mcp_server = mcp_server
+    app.state.mcp_external_aliases = external_mcp_aliases
+    app.state.mcp_external_approved = approved_external_mcp_tools
+    app.state.behavior_analyzer = behavior_analyzer
+    app.state.agent_runtime = agent_runtime
+
+    def _csv_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _audits_to_csv(rows: list[dict[str, Any]]) -> str:
+        output = io.StringIO()
+        fieldnames = [
+            "change_id",
+            "timestamp",
+            "status",
+            "type",
+            "mode",
+            "mode_reason",
+            "risk_level",
+            "source",
+            "actor",
+            "reason",
+            "approved_by",
+            "approved_at",
+            "rolled_back_by",
+            "rolled_back_at",
+            "belief",
+            "target",
+            "updates",
+            "before",
+            "after",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in rows:
+            writer.writerow({name: _csv_value(item.get(name)) for name in fieldnames})
+        return output.getvalue()
+
+    def _parse_datetime(raw: str | None) -> datetime | None:
+        safe = str(raw or "").strip()
+        if not safe:
+            return None
+        try:
+            dt = datetime.fromisoformat(safe.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _filter_rows_by_time(
+        rows: list[dict[str, Any]],
+        *,
+        start_at: str | None = None,
+        end_at: str | None = None,
+    ) -> list[dict[str, Any]]:
+        start_dt = _parse_datetime(start_at)
+        end_dt = _parse_datetime(end_at)
+        if start_dt is None and end_dt is None:
+            return list(rows)
+        result: list[dict[str, Any]] = []
+        for item in rows:
+            ts = _parse_datetime(str(item.get("timestamp") or ""))
+            if ts is None:
+                continue
+            if start_dt is not None and ts < start_dt:
+                continue
+            if end_dt is not None and ts > end_dt:
+                continue
+            result.append(item)
+        return result
+
+    def _paginate_rows(
+        rows: list[dict[str, Any]],
+        *,
+        limit: int,
+        cursor: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None, int, int]:
+        safe_limit = max(1, min(int(limit), 5000))
+        safe_cursor = 0
+        try:
+            safe_cursor = max(0, int(str(cursor or "0").strip() or "0"))
+        except Exception:
+            safe_cursor = 0
+        total = len(rows)
+        page = rows[safe_cursor : safe_cursor + safe_limit]
+        next_cursor: str | None = None
+        if safe_cursor + len(page) < total:
+            next_cursor = str(safe_cursor + len(page))
+        return page, next_cursor, total, safe_cursor
+
+    def _build_trend_series(
+        *,
+        rows: list[dict[str, Any]],
+        bucket: str,
+        window_hours: int,
+    ) -> list[dict[str, Any]]:
+        safe_bucket = "day" if bucket == "day" else "hour"
+        safe_window = max(1, min(int(window_hours), 24 * 30))
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        if safe_bucket == "hour":
+            step = timedelta(hours=1)
+            buckets_total = min(safe_window, 24 * 14)
+            start = now - step * (buckets_total - 1)
+            key_fmt = "%Y-%m-%dT%H:00:00Z"
+        else:
+            step = timedelta(days=1)
+            buckets_total = max(1, min((safe_window + 23) // 24, 90))
+            day_start = now.replace(hour=0)
+            start = day_start - step * (buckets_total - 1)
+            key_fmt = "%Y-%m-%d"
+
+        counts: dict[str, int] = {}
+        for idx in range(buckets_total):
+            bucket_dt = start + step * idx
+            counts[bucket_dt.strftime(key_fmt)] = 0
+
+        end = start + step * buckets_total
+        for item in rows:
+            ts = _parse_datetime(str(item.get("timestamp") or ""))
+            if ts is None or ts < start or ts >= end:
+                continue
+            if safe_bucket == "hour":
+                key = ts.replace(minute=0, second=0, microsecond=0).strftime(key_fmt)
+            else:
+                key = ts.replace(hour=0, minute=0, second=0, microsecond=0).strftime(key_fmt)
+            if key in counts:
+                counts[key] += 1
+
+        return [{"bucket": key, "count": count} for key, count in counts.items()]
+
+    def _persist_rules_file(*, rules: dict[str, Any], persist: bool) -> tuple[bool, str | None]:
+        if not persist:
+            return False, None
+        resolved_path = str((getattr(app.state, "evolution_rules", {}) or {}).get("resolved_path") or resolved_rules_path)
+        target = Path(resolved_path).expanduser()
+        if not target.is_absolute():
+            target = Path.cwd() / target
+        payload = {
+            "default_mode": str(rules.get("default_mode") or "autonomous"),
+            "change_modes": dict(rules.get("change_modes") or {}),
+            "risk_mode_overrides": dict(rules.get("risk_mode_overrides") or {}),
+            "change_risk_mode_overrides": dict(rules.get("change_risk_mode_overrides") or {}),
+        }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, str(target.resolve())
+
+    def _count_status_in_window(
+        rows: list[dict[str, Any]],
+        *,
+        status: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        safe_status = str(status or "").strip().lower()
+        total = 0
+        for item in rows:
+            if str(item.get("status") or "").strip().lower() != safe_status:
+                continue
+            ts = _parse_datetime(str(item.get("timestamp") or ""))
+            if ts is None or ts < start or ts >= end:
+                continue
+            total += 1
+        return total
+
+    def _detect_audit_alerts(
+        *,
+        rows: list[dict[str, Any]],
+        window_hours: int,
+    ) -> list[dict[str, Any]]:
+        safe_window = max(1, min(int(window_hours), 24 * 30))
+        now = datetime.now(timezone.utc)
+        current_start = now - timedelta(hours=safe_window)
+        previous_start = current_start - timedelta(hours=safe_window)
+
+        pending_current = _count_status_in_window(rows, status="pending_approval", start=current_start, end=now)
+        pending_previous = _count_status_in_window(rows, status="pending_approval", start=previous_start, end=current_start)
+        gated_current = _count_status_in_window(rows, status="blocked_by_gate", start=current_start, end=now)
+        gated_previous = _count_status_in_window(rows, status="blocked_by_gate", start=previous_start, end=current_start)
+        rejected_current = _count_status_in_window(rows, status="rejected", start=current_start, end=now)
+
+        alerts: list[dict[str, Any]] = []
+        if pending_current >= 8:
+            alerts.append(
+                {
+                    "level": "warning",
+                    "type": "pending_backlog",
+                    "message": "Pending approvals backlog is high.",
+                    "current": pending_current,
+                    "previous": pending_previous,
+                }
+            )
+        if pending_current >= 4 and pending_current >= max(1, pending_previous) * 2:
+            alerts.append(
+                {
+                    "level": "warning",
+                    "type": "pending_spike",
+                    "message": "Pending approvals increased sharply.",
+                    "current": pending_current,
+                    "previous": pending_previous,
+                }
+            )
+        if gated_current >= 3:
+            alerts.append(
+                {
+                    "level": "critical",
+                    "type": "gated_spike",
+                    "message": "Gated changes are unusually high.",
+                    "current": gated_current,
+                    "previous": gated_previous,
+                }
+            )
+        if rejected_current >= 6:
+            alerts.append(
+                {
+                    "level": "warning",
+                    "type": "rejected_spike",
+                    "message": "Rejected changes are unusually high.",
+                    "current": rejected_current,
+                }
+            )
+        return alerts
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "app": settings.app_name,
+            "environment": settings.environment,
+            "modules": [module.name for module in module_registry.modules],
+        }
+
+    # -- Agent Runtime control plane ----------------------------------------
+
+    @app.get("/api/runtime/status")
+    async def runtime_status() -> dict[str, Any]:
+        return {"ok": True, "result": agent_runtime.status()}
+
+    @app.post("/api/runtime/start")
+    async def runtime_start() -> dict[str, Any]:
+        started = agent_runtime.start()
+        return {"ok": started, "result": agent_runtime.status()}
+
+    @app.post("/api/runtime/stop")
+    async def runtime_stop() -> dict[str, Any]:
+        stopped = agent_runtime.stop()
+        return {"ok": stopped, "result": agent_runtime.status()}
+
+    @app.post("/api/runtime/trigger")
+    async def runtime_trigger() -> dict[str, Any]:
+        ran = await agent_runtime.trigger_once()
+        return {"ok": True, "result": {"ran_tasks": ran}}
+
+    @app.post("/api/runtime/reset/{task_name}")
+    async def runtime_reset(task_name: str) -> dict[str, Any]:
+        ok = agent_runtime.reset_circuit_breaker(task_name)
+        return {"ok": ok, "result": {"task_name": task_name}}
+
+    @app.post("/api/runtime/wake")
+    async def runtime_wake() -> dict[str, Any]:
+        result = agent_runtime.manual_wake()
+        return {"ok": True, "result": result}
+
+    @app.get("/api/runtime/heartbeat")
+    async def runtime_heartbeat() -> dict[str, Any]:
+        result = agent_runtime.heartbeat()
+        return {"ok": True, "result": result}
+
+    @app.post("/api/runtime/takeover")
+    async def runtime_takeover(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        reason = (payload or {}).get("reason", "manual")
+        result = agent_runtime.request_takeover(reason=reason)
+        return {"ok": True, "result": result}
+
+    @app.post("/api/runtime/pause")
+    async def runtime_pause(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        reason = (payload or {}).get("reason", "manual_pause")
+        result = agent_runtime.pause_patrols(reason=reason)
+        return {"ok": True, "result": result}
+
+    @app.post("/api/runtime/release")
+    async def runtime_release(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        auto_restart = (payload or {}).get("auto_restart", True)
+        result = agent_runtime.release_takeover(auto_restart=auto_restart)
+        return {"ok": True, "result": result}
+
+    @app.get("/api/runtime/checkpoints")
+    async def runtime_checkpoints() -> dict[str, Any]:
+        return {"ok": True, "result": agent_runtime.list_checkpoints()}
+
+    @app.get("/api/runtime/subagents")
+    async def runtime_subagents(parent_task_id: str | None = None) -> dict[str, Any]:
+        return {"ok": True, "result": agent_runtime.list_subagents(parent_task_id)}
+
+    # -- system info routes -------------------------------------------------
+
+    @app.get("/api/system/router/status")
+    async def router_status() -> dict[str, Any]:
+        return {
+            "known_intents": intent_router.known_intents(),
+            "router_rules_path": settings.router_rules_path,
+        }
+
+    @app.get("/api/system/policy/status")
+    async def policy_status() -> dict[str, Any]:
+        return {
+            "policy_rules_path": settings.policy_rules_path,
+            "blocked_keywords_from_env": bool(settings.policy_blocked_keywords.strip()),
+            "confirm_keywords_from_env": bool(settings.policy_confirm_keywords.strip()),
+        }
+
+    @app.post("/api/system/behavior-analysis")
+    async def behavior_analysis(session_id: str = "default", lookback: int = 50) -> dict:
+        proposals = app.state.behavior_analyzer.analyze_recent_behavior(
+            session_id=session_id, lookback_turns=lookback,
+        )
+        return {"proposals": proposals, "count": len(proposals)}
+
+    @app.get("/api/system/events/recent")
+    async def system_events_recent(
+        limit: int = 100,
+        event_type: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        rows = event_store.recent(
+            limit=max(1, min(limit, 2000)),
+            event_type=event_type,
+            trace_id=trace_id,
+        )
+        return {"total": len(rows), "items": rows}
+
+    @app.get("/api/system/events/stats")
+    async def system_events_stats(window_minutes: int = 60) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "result": event_store.stats(window_minutes=max(1, min(window_minutes, 24 * 60))),
+        }
+
+    @app.get("/api/system/events/export", response_model=None)
+    async def system_events_export(
+        limit: int = 1000,
+        event_type: str | None = None,
+        trace_id: str | None = None,
+        format: str = "json",
+    ) -> Any:
+        safe_limit = max(1, min(limit, 5000))
+        safe_format = str(format or "json").strip().lower()
+        rows = event_store.export(
+            limit=safe_limit,
+            event_type=event_type,
+            trace_id=trace_id,
+        )
+        if safe_format == "jsonl":
+            content = ""
+            if rows:
+                content = "\n".join(json.dumps(item, ensure_ascii=False) for item in rows) + "\n"
+            return Response(
+                content=content,
+                media_type="application/x-ndjson",
+                headers={"Cache-Control": "no-store"},
+            )
+        return {
+            "ok": True,
+            "total": len(rows),
+            "retention": event_store.retention(),
+            "items": rows,
+        }
+
+    @app.get("/api/system/events/stream")
+    async def system_events_stream(
+        replay_last: int = 0,
+        event_type: str | None = None,
+        trace_id: str | None = None,
+        heartbeat_sec: int = 15,
+        buffer_size: int = 200,
+        max_events: int = 0,
+    ) -> StreamingResponse:
+        safe_replay = max(0, min(replay_last, 500))
+        safe_heartbeat = max(1, min(heartbeat_sec, 60))
+        safe_max_events = max(0, min(max_events, 1000))
+        subscription = event_store.subscribe(
+            event_type=event_type,
+            trace_id=trace_id,
+            buffer_size=max(10, min(buffer_size, 2000)),
+        )
+        replay_rows = event_store.export(
+            limit=safe_replay,
+            event_type=event_type,
+            trace_id=trace_id,
+        )
+
+        def _iter_events():  # noqa: ANN202
+            emitted = 0
+            try:
+                for row in replay_rows:
+                    yield _format_sse_event(row)
+                    emitted += 1
+                    if safe_max_events and emitted >= safe_max_events:
+                        return
+                while True:
+                    row = subscription.poll(timeout_sec=float(safe_heartbeat))
+                    if row is None:
+                        yield ": keep-alive\n\n"
+                        continue
+                    yield _format_sse_event(row)
+                    emitted += 1
+                    if safe_max_events and emitted >= safe_max_events:
+                        return
+            finally:
+                subscription.close()
+
+        return StreamingResponse(
+            _iter_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @app.post("/api/system/events/clear")
+    async def system_events_clear(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        confirm = bool(request_payload.get("confirm", False))
+        if not confirm:
+            return {"ok": False, "needs_confirmation": True}
+        removed = event_store.clear()
+        return {"ok": True, "removed": removed}
+
+    @app.get("/api/brain/tools")
+    async def brain_tools() -> dict[str, Any]:
+        _register_external_mcp_tools()
+        tools = tool_registry.list_tools()
+        return {
+            "total": len(tools),
+            "items": [
+                {
+                    "name": item.name,
+                    "description": item.description,
+                    "ring": item.ring,
+                    "schema": item.schema,
+                    "metadata": item.metadata,
+                }
+                for item in tools
+            ],
+        }
+
+    @app.get("/api/brain/cost/status")
+    async def brain_cost_status() -> dict[str, Any]:
+        return cost_controller.status()
+
+    @app.get("/api/memory/core")
+    async def memory_core() -> dict[str, Any]:
+        return {
+            "snapshot": core_memory.snapshot(),
+            "system_prompt": core_memory.build_system_prompt(max_chars=1200),
+        }
+
+    @app.post("/api/memory/core/update")
+    async def memory_core_update(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        block = str(request_payload.get("block") or "").strip().lower()
+        if not block:
+            raise HTTPException(status_code=400, detail="block is required")
+        content = request_payload.get("content")
+        merge = bool(request_payload.get("merge", True))
+        try:
+            if block == "prefs":
+                if not isinstance(content, dict):
+                    raise HTTPException(status_code=400, detail="prefs update requires dict content")
+                updated = core_memory.update_preferences(content)
+            else:
+                updated = core_memory.update_block(block=block, content=content, merge=merge)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "block": block, "updated": updated}
+
+    @app.get("/api/memory/recall/recent")
+    async def memory_recall_recent(limit: int = 20, session_id: str | None = None) -> dict[str, Any]:
+        rows = recall_memory.recent(limit=max(1, min(limit, 200)), session_id=session_id)
+        return {"total": len(rows), "items": rows}
+
+    @app.post("/api/memory/search")
+    async def memory_search(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        query = str(request_payload.get("query") or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+        top_k_raw = request_payload.get("top_k", 5)
+        try:
+            top_k = int(top_k_raw)
+        except Exception:
+            top_k = 5
+        min_similarity_raw = request_payload.get("min_similarity", 0.2)
+        try:
+            min_similarity = float(min_similarity_raw)
+        except Exception:
+            min_similarity = 0.2
+        session_id = str(request_payload.get("session_id") or "").strip() or None
+        rows = recall_memory.search(
+            query=query,
+            top_k=max(1, min(top_k, 30)),
+            min_similarity=max(0.0, min(min_similarity, 1.0)),
+            session_id=session_id,
+        )
+        return {"query": query, "total": len(rows), "items": rows}
+
+    @app.get("/api/memory/archival/recent")
+    async def memory_archival_recent(limit: int = 20) -> dict[str, Any]:
+        rows = archival_memory.recent(limit=max(1, min(limit, 500)))
+        return {"total": len(rows), "items": rows}
+
+    @app.post("/api/memory/archival/query")
+    async def memory_archival_query(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        subject = str(request_payload.get("subject") or "").strip() or None
+        predicate = str(request_payload.get("predicate") or "").strip() or None
+        keyword = str(request_payload.get("keyword") or "").strip() or None
+        limit_raw = request_payload.get("limit", 30)
+        try:
+            limit = int(limit_raw)
+        except Exception:
+            limit = 30
+        rows = archival_memory.query(
+            subject=subject,
+            predicate=predicate,
+            keyword=keyword,
+            limit=max(1, min(limit, 300)),
+        )
+        return {
+            "total": len(rows),
+            "items": rows,
+            "filters": {"subject": subject, "predicate": predicate, "keyword": keyword},
+        }
+
+    @app.get("/api/evolution/status")
+    async def evolution_status() -> dict[str, Any]:
+        context_block = core_memory.read_block("context")
+        context = context_block if isinstance(context_block, dict) else {}
+        beliefs = context.get("beliefs") if isinstance(context.get("beliefs"), dict) else {}
+        governance_modes = governance.mode_status()
+        stats = governance.audit_stats(window_hours=24)
+        loaded_rules = dict(getattr(app.state, "evolution_rules", {}) or {})
+        latest_rules_version = rules_version_store.latest()
+        return {
+            "audit_total": stats["total"],
+            "audit_in_24h": stats["in_window"],
+            "archival_total": archival_memory.count(),
+            "dpo_pairs_total": dpo_collector.count(),
+            "governance_mode": governance_modes["default_mode"],
+            "governance_change_modes": governance_modes["change_modes"],
+            "governance_risk_modes": governance_modes.get("risk_mode_overrides", {}),
+            "governance_change_risk_modes": governance_modes.get("change_risk_mode_overrides", {}),
+            "evolution_rules_path": str(loaded_rules.get("resolved_path") or settings.evolution_rules_path),
+            "rules_versions_total": rules_version_store.count(),
+            "rules_current_version_id": str((latest_rules_version or {}).get("version_id") or ""),
+            "core_beliefs": list(beliefs.get("core") or []),
+            "mutable_beliefs": list(beliefs.get("mutable") or []),
+        }
+
+    @app.get("/api/evolution/audits")
+    async def evolution_audits(
+        limit: int = 30,
+        cursor: str | None = None,
+        status: str | None = None,
+        change_type: str | None = None,
+        mode: str | None = None,
+        risk_level: str | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
+    ) -> dict[str, Any]:
+        rows = governance.list_audits(
+            limit=5000,
+            status=status,
+            change_type=change_type,
+            mode=mode,
+            risk_level=risk_level,
+        )
+        filtered_rows = _filter_rows_by_time(rows, start_at=start_at, end_at=end_at)
+        page_rows, next_cursor, total, used_cursor = _paginate_rows(
+            filtered_rows,
+            limit=max(1, min(limit, 5000)),
+            cursor=cursor,
+        )
+        return {
+            "total": total,
+            "cursor": str(used_cursor),
+            "next_cursor": next_cursor,
+            "items": page_rows,
+        }
+
+    @app.get("/api/evolution/audits/stats")
+    async def evolution_audits_stats(window_hours: int = 24) -> dict[str, Any]:
+        stats = governance.audit_stats(window_hours=max(1, min(window_hours, 24 * 30)))
+        return {"ok": True, "result": stats}
+
+    @app.get("/api/evolution/audits/export")
+    async def evolution_audits_export(
+        format: str = "json",
+        limit: int = 1000,
+        cursor: str | None = None,
+        status: str | None = None,
+        change_type: str | None = None,
+        mode: str | None = None,
+        risk_level: str | None = None,
+        start_at: str | None = None,
+        end_at: str | None = None,
+    ) -> Any:
+        safe_format = str(format or "json").strip().lower()
+        safe_limit = max(1, min(limit, 5000))
+        rows = governance.list_audits(
+            limit=5000,
+            status=status,
+            change_type=change_type,
+            mode=mode,
+            risk_level=risk_level,
+        )
+        filtered_rows = _filter_rows_by_time(rows, start_at=start_at, end_at=end_at)
+        page_rows, next_cursor, total, used_cursor = _paginate_rows(
+            filtered_rows,
+            limit=safe_limit,
+            cursor=cursor,
+        )
+        filters = {
+            "status": status,
+            "change_type": change_type,
+            "mode": mode,
+            "risk_level": risk_level,
+            "start_at": start_at,
+            "end_at": end_at,
+            "limit": safe_limit,
+            "cursor": str(used_cursor),
+        }
+        if safe_format == "csv":
+            csv_text = _audits_to_csv(page_rows)
+            headers = {"Content-Disposition": "attachment; filename=evolution_audits.csv"}
+            if next_cursor is not None:
+                headers["X-Next-Cursor"] = next_cursor
+            return Response(
+                content=csv_text,
+                media_type="text/csv; charset=utf-8",
+                headers=headers,
+            )
+        if safe_format != "json":
+            raise HTTPException(status_code=400, detail="format must be json or csv")
+        return {
+            "ok": True,
+            "format": "json",
+            "total": total,
+            "cursor": str(used_cursor),
+            "next_cursor": next_cursor,
+            "filters": filters,
+            "items": page_rows,
+        }
+
+    @app.get("/api/evolution/dashboard")
+    async def evolution_dashboard(window_hours: int = 24, recent_limit: int = 10) -> dict[str, Any]:
+        safe_window = max(1, min(window_hours, 24 * 30))
+        safe_recent_limit = max(1, min(recent_limit, 50))
+        context_block = core_memory.read_block("context")
+        context = context_block if isinstance(context_block, dict) else {}
+        beliefs = context.get("beliefs") if isinstance(context.get("beliefs"), dict) else {}
+        stats = governance.audit_stats(window_hours=safe_window)
+        all_recent_for_window = governance.list_audits(limit=5000)
+        window_rows = _filter_rows_by_time(
+            all_recent_for_window,
+            start_at=(datetime.now(timezone.utc) - timedelta(hours=safe_window)).isoformat(),
+            end_at=datetime.now(timezone.utc).isoformat(),
+        )
+        alerts = _detect_audit_alerts(rows=window_rows, window_hours=safe_window)
+        pending = governance.list_audits(status="pending_approval", limit=200)
+        recent = governance.list_audits(limit=safe_recent_limit)
+        governance_mode = governance.mode_status()
+        return {
+            "ok": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "window_hours": safe_window,
+            "governance": governance_mode,
+            "audits": {
+                "stats": stats,
+                "pending_total": len(pending),
+                "pending_items": pending[:5],
+                "recent": recent,
+                "trends": {
+                    "hourly": _build_trend_series(rows=window_rows, bucket="hour", window_hours=safe_window),
+                    "daily": _build_trend_series(rows=window_rows, bucket="day", window_hours=safe_window),
+                },
+                "alerts": alerts,
+            },
+            "memory": {
+                "archival_total": archival_memory.count(),
+                "dpo_pairs_total": dpo_collector.count(),
+                "core_beliefs_total": len(list(beliefs.get("core") or [])),
+                "mutable_beliefs_total": len(list(beliefs.get("mutable") or [])),
+            },
+        }
+
+    @app.get("/api/evolution/governance/mode")
+    async def evolution_governance_mode() -> dict[str, Any]:
+        return {"ok": True, "result": governance.mode_status()}
+
+    @app.get("/api/evolution/governance/versions")
+    async def evolution_governance_versions(limit: int = 20, cursor: str | None = None) -> dict[str, Any]:
+        page = rules_version_store.list_versions(limit=max(1, min(limit, 500)), cursor=cursor)
+        latest = rules_version_store.latest()
+        return {
+            "ok": True,
+            "total": int(page.get("total") or 0),
+            "cursor": str(page.get("cursor") or "0"),
+            "next_cursor": page.get("next_cursor"),
+            "current_version_id": str((latest or {}).get("version_id") or ""),
+            "items": list(page.get("items") or []),
+        }
+
+    @app.get("/api/evolution/governance/versions/diff")
+    async def evolution_governance_versions_diff(
+        from_version_id: str | None = None,
+        to_version_id: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        diff = rules_version_store.diff_versions(
+            from_version_id=from_version_id,
+            to_version_id=to_version_id,
+        )
+        changes = list(diff.get("changes") or [])
+        safe_limit = max(1, min(limit, 1000))
+        return {
+            "ok": bool(diff.get("ok")),
+            "from_version_id": diff.get("from_version_id"),
+            "to_version_id": diff.get("to_version_id"),
+            "summary": diff.get("summary") or {"total": 0, "added": 0, "removed": 0, "updated": 0},
+            "changes_total": len(changes),
+            "changes": changes[:safe_limit],
+            "reason": diff.get("reason"),
+        }
+
+    @app.post("/api/evolution/governance/versions/rollback")
+    async def evolution_governance_version_rollback(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        version_id = str(request_payload.get("version_id") or "").strip()
+        if not version_id:
+            raise HTTPException(status_code=400, detail="version_id is required")
+        confirm = bool(request_payload.get("confirm", False))
+        if not confirm:
+            return {"ok": False, "needs_confirmation": True}
+        persist = bool(request_payload.get("persist", True))
+        target = rules_version_store.get(version_id=version_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"version_id not found: {version_id}")
+        rules = dict(target.get("rules") or {})
+        apply_result = governance.replace_modes(
+            default_mode=str(rules.get("default_mode") or "autonomous"),
+            change_modes=dict(rules.get("change_modes") or {}),
+            risk_mode_overrides=dict(rules.get("risk_mode_overrides") or {}),
+            change_risk_mode_overrides=dict(rules.get("change_risk_mode_overrides") or {}),
+        )
+        app.state.evolution_rules = {
+            **rules,
+            "resolved_path": str(getattr(app.state, "evolution_rules", {}).get("resolved_path") or settings.evolution_rules_path),
+        }
+        persisted = False
+        persisted_path: str | None = None
+        try:
+            persisted, persisted_path = _persist_rules_file(rules=apply_result, persist=persist)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": str(exc)[:500],
+                "result": apply_result,
+                "rolled_back_from_version_id": version_id,
+            }
+        new_version = rules_version_store.record(
+            rules=apply_result,
+            source="version_rollback",
+            actor="api",
+            metadata={"from_version_id": version_id},
+            dedupe=False,
+        )
+        return {
+            "ok": True,
+            "result": apply_result,
+            "rolled_back_from_version_id": version_id,
+            "new_version_id": str(new_version.get("version_id") or ""),
+            "persisted": persisted,
+            "persisted_path": persisted_path,
+        }
+
+    @app.post("/api/evolution/governance/reload")
+    async def evolution_governance_reload(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        confirm = bool(request_payload.get("confirm", False))
+        if not confirm:
+            return {"ok": False, "needs_confirmation": True}
+        options = _load_governance_options()
+        result = governance.replace_modes(
+            default_mode=str(options.get("default_mode") or "autonomous"),
+            change_modes=dict(options.get("change_modes") or {}),
+            risk_mode_overrides=dict(options.get("risk_mode_overrides") or {}),
+            change_risk_mode_overrides=dict(options.get("change_risk_mode_overrides") or {}),
+        )
+        app.state.evolution_rules = options
+        new_version = rules_version_store.record(
+            rules=result,
+            source="reload_from_file",
+            actor="api",
+            metadata={"loaded_from": str(options.get("resolved_path") or settings.evolution_rules_path)},
+            dedupe=False,
+        )
+        return {
+            "ok": True,
+            "result": result,
+            "loaded_from": str(options.get("resolved_path") or settings.evolution_rules_path),
+            "new_version_id": str(new_version.get("version_id") or ""),
+        }
+
+    @app.post("/api/evolution/governance/mode")
+    async def evolution_governance_mode_update(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        mode = str(request_payload.get("mode") or "").strip()
+        if not mode:
+            raise HTTPException(status_code=400, detail="mode is required")
+        change_type = str(request_payload.get("change_type") or "").strip() or None
+        risk_level = str(request_payload.get("risk_level") or "").strip() or None
+        persist = bool(request_payload.get("persist", True))
+        result = governance.set_mode(mode=mode, change_type=change_type, risk_level=risk_level)
+        persisted = False
+        persisted_path: str | None = None
+        try:
+            persisted, persisted_path = _persist_rules_file(rules=result, persist=persist)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:500], "result": result}
+        new_version = rules_version_store.record(
+            rules=result,
+            source="manual_mode_update",
+            actor="api",
+            metadata={"change_type": change_type, "risk_level": risk_level, "mode": mode},
+            dedupe=False,
+        )
+        return {
+            "ok": True,
+            "result": result,
+            "new_version_id": str(new_version.get("version_id") or ""),
+            "persisted": persisted,
+            "persisted_path": persisted_path,
+        }
+
+    @app.post("/api/evolution/governance/approve")
+    async def evolution_governance_approve(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        change_id = str(request_payload.get("change_id") or "").strip()
+        if not change_id:
+            raise HTTPException(status_code=400, detail="change_id is required")
+        confirm = bool(request_payload.get("confirm", False))
+        if not confirm:
+            return {"ok": False, "needs_confirmation": True}
+        try:
+            result = governance.approve_change(change_id=change_id, actor="api")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": bool(result.get("ok")), "result": result}
+
+    @app.post("/api/evolution/reflect")
+    async def evolution_reflect(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        user_text = str(request_payload.get("user_text") or "").strip()
+        assistant_text = str(request_payload.get("assistant_text") or "").strip()
+        if not user_text:
+            raise HTTPException(status_code=400, detail="user_text is required")
+        metadata_raw = request_payload.get("metadata")
+        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+        result = evolution_engine.reflect_interaction(
+            user_text=user_text,
+            assistant_text=assistant_text,
+            metadata=metadata,
+        )
+        return {"ok": True, "result": result.to_dict()}
+
+    @app.post("/api/evolution/rollback")
+    async def evolution_rollback(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        change_id = str(request_payload.get("change_id") or "").strip()
+        if not change_id:
+            raise HTTPException(status_code=400, detail="change_id is required")
+        confirm = bool(request_payload.get("confirm", False))
+        if not confirm:
+            return {"ok": False, "needs_confirmation": True}
+        try:
+            result = governance.rollback(change_id=change_id, actor="api")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"ok": bool(result.get("ok")), "result": result}
+
+    @app.get("/api/learning/dpo/status")
+    async def learning_dpo_status() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "total": dpo_collector.count(),
+            "auto_collect": bool(settings.dpo_auto_collect),
+            "storage_path": settings.dpo_pairs_path,
+        }
+
+    @app.get("/api/learning/dpo/recent")
+    async def learning_dpo_recent(limit: int = 20) -> dict[str, Any]:
+        rows = dpo_collector.recent(limit=max(1, min(limit, 200)))
+        return {"total": len(rows), "items": rows}
+
+    @app.post("/api/learning/dpo/collect")
+    async def learning_dpo_collect(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        prompt = str(request_payload.get("prompt") or "").strip()
+        chosen = str(request_payload.get("chosen") or "").strip()
+        rejected = str(request_payload.get("rejected") or "").strip()
+        if not prompt or not chosen or not rejected:
+            raise HTTPException(status_code=400, detail="prompt/chosen/rejected are required")
+        metadata_raw = request_payload.get("metadata")
+        metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
+        try:
+            pair = dpo_collector.add_pair(
+                prompt=prompt,
+                chosen=chosen,
+                rejected=rejected,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "item": pair}
+
+    @app.get("/api/skills/list")
+    async def skills_list(status: str | None = None) -> dict[str, Any]:
+        rows = skill_generator.list_skills(status=status)
+        return {"total": len(rows), "items": rows}
+
+    @app.post("/api/skills/generate")
+    async def skills_generate(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        prompt = str(request_payload.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="prompt is required")
+        tool_name = str(request_payload.get("tool_name") or "").strip() or None
+        description = str(request_payload.get("description") or "").strip() or None
+        code_override_raw = request_payload.get("code")
+        code_override = str(code_override_raw).strip() if isinstance(code_override_raw, str) else None
+        try:
+            record = skill_generator.create_skill(
+                prompt=prompt,
+                tool_name=tool_name,
+                description=description,
+                code_override=code_override,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "ok": str(record.get("status") or "") != "blocked",
+            "skill": record,
+            "policy": {
+                "action": "confirm",
+                "reason": "generated skill requires explicit activation confirmation",
+            },
+        }
+
+    @app.post("/api/skills/activate")
+    async def skills_activate(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        skill_id = str(request_payload.get("skill_id") or "").strip()
+        if not skill_id:
+            raise HTTPException(status_code=400, detail="skill_id is required")
+        confirm = bool(request_payload.get("confirm", False))
+        policy = policy_engine.evaluate(
+            intent="skill.activate",
+            text=f"activate generated skill {skill_id}",
+            metadata={"generated_skill": True, "skill_id": skill_id},
+        )
+        if policy.action == "blocked":
+            raise HTTPException(status_code=403, detail=policy.reason)
+        if policy.action == "confirm" and not confirm:
+            return {
+                "ok": False,
+                "needs_confirmation": True,
+                "policy": {
+                    "action": policy.action,
+                    "reason": policy.reason,
+                    "matched_rule": policy.matched_rule,
+                },
+            }
+        try:
+            result = skill_generator.activate_skill(skill_id=skill_id, confirm=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "ok": bool(result.get("ok")),
+            "result": result,
+            "policy": {
+                "action": policy.action,
+                "reason": policy.reason,
+                "matched_rule": policy.matched_rule,
+            },
+        }
+
+    @app.post("/api/brain/run")
+    async def brain_run(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        query = str(request_payload.get("query") or "").strip()
+        if not query:
+            raise HTTPException(status_code=400, detail="query is required")
+        max_steps_raw = request_payload.get("max_steps")
+        max_steps = None
+        if isinstance(max_steps_raw, int):
+            max_steps = max_steps_raw
+        elif isinstance(max_steps_raw, str) and max_steps_raw.strip().isdigit():
+            max_steps = int(max_steps_raw.strip())
+        prefer_llm_raw = request_payload.get("prefer_llm")
+        if isinstance(prefer_llm_raw, bool):
+            prefer_llm = prefer_llm_raw
+        else:
+            prefer_llm = settings.brain_prefer_llm
+        metadata = request_payload.get("metadata")
+        safe_metadata = metadata if isinstance(metadata, dict) else {}
+        safe_metadata.setdefault("intent", "brain.run")
+        api_ctx = create_interactive_context(
+            session_id=str(safe_metadata.get("session_id") or ""),
+        )
+        trace_id = api_ctx.trace_id
+        started_at = time.perf_counter()
+        _emit_event(
+            "brain.run.started",
+            {
+                "trace_id": trace_id,
+                "source": "api",
+                "query_preview": _preview(query, max_chars=220),
+                "prefer_llm": bool(prefer_llm),
+                "max_steps": max_steps,
+            },
+        )
+        try:
+            result = await brain.run(
+                query=query,
+                ctx=api_ctx,
+                metadata=safe_metadata,
+                max_steps=max_steps,
+                prefer_llm=prefer_llm,
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "brain.run.failed",
+                {
+                    "trace_id": trace_id,
+                    "source": "api",
+                    "error": str(exc)[:500],
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        _emit_event(
+            "brain.run.completed",
+            {
+                "trace_id": trace_id,
+                "source": "api",
+                "used_tools": list(result.used_tools),
+                "stopped_reason": result.stopped_reason,
+                "steps_total": len(result.steps),
+                "latency_ms": latency_ms,
+            },
+        )
+        for step in result.steps:
+            _emit_event(
+                "brain.step",
+                {
+                    "trace_id": trace_id,
+                    "source": "api",
+                    "index": int(step.index),
+                    "action": step.action,
+                    "tool_name": step.tool_name,
+                    "tool_args": dict(step.tool_args or {}),
+                    "observation_preview": _preview(step.observation, max_chars=240),
+                },
+            )
+            if step.action == "use_tool" and step.tool_name:
+                _emit_event(
+                    "brain.tool.invoked",
+                    {
+                        "trace_id": trace_id,
+                        "source": "api",
+                        "tool_name": step.tool_name,
+                        "tool_args": dict(step.tool_args or {}),
+                        "observation_preview": _preview(step.observation, max_chars=240),
+                    },
+                )
+        return {
+            "ok": True,
+            "trace_id": trace_id,
+            "result": result.to_dict(),
+            "cost": cost_controller.status(),
+            "latency_ms": latency_ms,
+        }
+
+    @app.post("/mcp", response_model=None)
+    async def mcp_streamable_http(request: Request, payload: dict[str, Any] | None = Body(default=None)) -> Response:
+        message = payload or {}
+        if not isinstance(message, dict):
+            raise HTTPException(status_code=400, detail="invalid MCP JSON-RPC payload")
+        method = str(message.get("method") or "").strip()
+        if not method:
+            raise HTTPException(status_code=400, detail="method is required")
+
+        if method == "initialize":
+            response_payload = await mcp_server.handle_jsonrpc(message)
+            session_id = f"mcp_{uuid.uuid4().hex[:16]}"
+            init_params = message.get("params")
+            init_payload = dict(init_params) if isinstance(init_params, dict) else {}
+            mcp_sessions[session_id] = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "initialized": False,
+                "client_info": dict(init_payload.get("clientInfo") or {}) if isinstance(init_payload.get("clientInfo"), dict) else {},
+                "protocol_version": str(init_payload.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION).strip() or DEFAULT_PROTOCOL_VERSION,
+            }
+            return Response(
+                content=json.dumps(response_payload or {}, ensure_ascii=False),
+                media_type="application/json",
+                headers=_mcp_response_headers(session_id=session_id),
+            )
+
+        session_id, session = _mcp_lookup_session(request)
+        if session is None:
+            return Response(status_code=404, headers=_mcp_response_headers())
+
+        if message.get("id") is None:
+            if method == "notifications/initialized":
+                session["initialized"] = True
+            else:
+                await mcp_server.handle_jsonrpc(message)
+            return Response(status_code=202, headers=_mcp_response_headers(session_id=session_id))
+
+        response_payload = await mcp_server.handle_jsonrpc(message)
+        return Response(
+            content=json.dumps(response_payload or {}, ensure_ascii=False),
+            media_type="application/json",
+            headers=_mcp_response_headers(session_id=session_id),
+        )
+
+    @app.get("/api/mcp/tools")
+    async def mcp_tools() -> dict[str, Any]:
+        external_tools = _register_external_mcp_tools()
+        local_tools = mcp_server.list_tools()
+        return {
+            "external_enabled": active_mcp_transport is not None,
+            "local_total": len(local_tools),
+            "external_total": len(external_tools),
+            "local_tools": local_tools,
+            "external_tools": external_tools,
+        }
+
+    @app.post("/api/mcp/call")
+    async def mcp_call(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        name = str(request_payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name is required")
+        arguments_raw = request_payload.get("arguments")
+        arguments = arguments_raw if isinstance(arguments_raw, dict) else {}
+        server_name = str(request_payload.get("server") or "").strip()
+        confirm = bool(request_payload.get("confirm", False))
+        trace_id = str(request_payload.get("trace_id") or "").strip() or f"trace_{uuid.uuid4().hex[:12]}"
+        started_at = time.perf_counter()
+        _emit_event(
+            "mcp.call.started",
+            {
+                "trace_id": trace_id,
+                "server": server_name or "local",
+                "name": name,
+                "arguments": dict(arguments),
+                "confirm": confirm,
+            },
+        )
+        try:
+            if server_name:
+                _register_external_mcp_tools()
+                try:
+                    payload_preview = json.dumps(arguments, ensure_ascii=False)
+                except Exception:
+                    payload_preview = str(arguments)
+                policy = policy_engine.evaluate(
+                    intent="mcp.external.call",
+                    text=f"{server_name}.{name} {payload_preview}",
+                    metadata={"server": server_name, "name": name, "arguments": arguments},
+                )
+                if policy.action == "blocked":
+                    raise HTTPException(status_code=403, detail=policy.reason)
+                approval_key = _approval_key(server_name, name)
+                if policy.action == "confirm" and not confirm and approval_key not in approved_external_mcp_tools:
+                    latency_ms = int((time.perf_counter() - started_at) * 1000)
+                    _emit_event(
+                        "mcp.call.needs_confirmation",
+                        {
+                            "trace_id": trace_id,
+                            "server": server_name,
+                            "name": name,
+                            "policy_action": policy.action,
+                            "policy_reason": policy.reason,
+                            "latency_ms": latency_ms,
+                        },
+                    )
+                    return {
+                        "ok": False,
+                        "mode": "external",
+                        "trace_id": trace_id,
+                        "needs_confirmation": True,
+                        "server": server_name,
+                        "name": name,
+                        "policy": {
+                            "action": policy.action,
+                            "reason": policy.reason,
+                            "matched_rule": policy.matched_rule,
+                        },
+                    }
+                result = await mcp_client.call_tool(server=server_name, name=name, arguments=arguments)
+                approved_external_mcp_tools.add(approval_key)
+                latency_ms = int((time.perf_counter() - started_at) * 1000)
+                _emit_event(
+                    "mcp.call.completed",
+                    {
+                        "trace_id": trace_id,
+                        "mode": "external",
+                        "server": server_name,
+                        "name": name,
+                        "latency_ms": latency_ms,
+                        "result_preview": _preview(result, max_chars=260),
+                    },
+                )
+                return {
+                    "ok": True,
+                    "mode": "external",
+                    "trace_id": trace_id,
+                    "server": server_name,
+                    "name": name,
+                    "result": result,
+                    "latency_ms": latency_ms,
+                }
+            result = await mcp_server.call_tool(name=name, arguments=arguments)
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "mcp.call.completed",
+                {
+                    "trace_id": trace_id,
+                    "mode": "local",
+                    "server": "local",
+                    "name": name,
+                    "latency_ms": latency_ms,
+                    "result_preview": _preview(result, max_chars=260),
+                },
+            )
+            return {"ok": True, "mode": "local", "trace_id": trace_id, "latency_ms": latency_ms, **result}
+        except HTTPException:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "mcp.call.failed",
+                {
+                    "trace_id": trace_id,
+                    "server": server_name or "local",
+                    "name": name,
+                    "error": "http_exception",
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise
+        except KeyError as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "mcp.call.failed",
+                {
+                    "trace_id": trace_id,
+                    "server": server_name or "local",
+                    "name": name,
+                    "error": str(exc)[:500],
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "mcp.call.failed",
+                {
+                    "trace_id": trace_id,
+                    "server": server_name or "local",
+                    "name": name,
+                    "error": str(exc)[:500],
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            _emit_event(
+                "mcp.call.failed",
+                {
+                    "trace_id": trace_id,
+                    "server": server_name or "local",
+                    "name": name,
+                    "error": str(exc)[:500],
+                    "latency_ms": latency_ms,
+                },
+            )
+            raise HTTPException(status_code=500, detail=str(exc)[:500]) from exc
+
+    @app.post("/api/system/route/resolve")
+    async def resolve_route(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        text = str(request_payload.get("text") or "").strip()
+        hinted_intent = str(request_payload.get("intent") or "").strip()
+        route = intent_router.resolve(text)
+        policy = policy_engine.evaluate(
+            intent=hinted_intent or route.intent,
+            text=text,
+            metadata=request_payload,
+        )
+        return {
+            "text": text,
+            "route": {
+                "intent": route.intent,
+                "target": route.target,
+                "method": route.method,
+                "confidence": route.confidence,
+                "reason": route.reason,
+            },
+            "policy": {
+                "action": policy.action,
+                "reason": policy.reason,
+                "matched_rule": policy.matched_rule,
+            },
+        }
+
+    @app.post("/api/channel/cli/ingest")
+    async def cli_ingest(payload: dict[str, Any] | None = Body(default=None)) -> dict[str, Any]:
+        request_payload = payload or {}
+        text = str(request_payload.get("text") or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text is required")
+        adapter = channel_adapters["cli"]
+        message = adapter.parse_incoming(text)
+        if message is None:
+            raise HTTPException(status_code=400, detail="invalid cli payload")
+        user_id = str(request_payload.get("user_id") or "").strip()
+        if user_id:
+            message.user_id = user_id
+        metadata = request_payload.get("metadata")
+        if isinstance(metadata, dict):
+            message.metadata.update(metadata)
+        result = adapter.dispatch(message)
+        if inspect.isawaitable(result):
+            result = await result
+        return {"ok": True, "result": result}
+
+    @app.post("/api/channel/feishu/events")
+    async def feishu_events(
+        request: Request,
+        payload: dict[str, Any] | None = Body(default=None),
+    ) -> dict[str, Any]:
+        request_payload = payload or {}
+        challenge = request_payload.get("challenge")
+        if isinstance(challenge, str) and challenge:
+            return {"challenge": challenge}
+
+        body_bytes = await request.body()
+        body_text = body_bytes.decode("utf-8", errors="ignore")
+        secret = settings.feishu_sign_secret.strip()
+        if secret:
+            signature = request.headers.get("X-Lark-Signature", "")
+            timestamp = request.headers.get("X-Lark-Request-Timestamp", "")
+            nonce = request.headers.get("X-Lark-Request-Nonce", "")
+            if not verify_feishu_signature(
+                secret=secret,
+                timestamp=timestamp,
+                nonce=nonce,
+                body=body_text or json.dumps(request_payload, ensure_ascii=False),
+                signature=signature,
+            ):
+                raise HTTPException(status_code=401, detail="invalid feishu signature")
+
+        adapter = channel_adapters["feishu"]
+        message = adapter.parse_incoming(request_payload)
+        if message is None:
+            return {"ok": True, "ignored": True}
+        result = adapter.dispatch(message)
+        if inspect.isawaitable(result):
+            result = await result
+        return {"ok": True, "ignored": False, "result": result}
+
+    module_registry.attach_to_app(app)
+    return app

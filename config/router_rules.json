@@ -1,0 +1,36 @@
+{
+  "fallback_intent": "general.default",
+  "fallback_target": "hello",
+  "intents": {
+    "general.default": "hello",
+    "boss.scan": "boss_greet",
+    "boss.greet.trigger": "boss_greet",
+    "boss.chat.pull": "boss_chat",
+    "boss.chat.process": "boss_chat",
+    "email.process": "email_tracker",
+    "email.fetch": "email_tracker",
+    "intel.interview.collect": "intel_interview",
+    "intel.interview.report": "intel_interview",
+    "intel.techradar.collect": "intel_techradar",
+    "intel.techradar.report": "intel_techradar",
+    "intel.query.search": "intel_query"
+  },
+  "exact": [
+    { "key": "ping", "intent": "general.default" },
+    { "key": "/ping", "intent": "general.default" }
+  ],
+  "prefix": [
+    { "prefix": "/scan", "intent": "boss.scan" },
+    { "prefix": "/greet", "intent": "boss.greet.trigger" },
+    { "prefix": "/chat pull", "intent": "boss.chat.pull" },
+    { "prefix": "/chat process", "intent": "boss.chat.process" },
+    { "prefix": "/email process", "intent": "email.process" },
+    { "prefix": "/email fetch", "intent": "email.fetch" },
+    { "prefix": "/intel interview collect", "intent": "intel.interview.collect" },
+    { "prefix": "/intel interview report", "intent": "intel.interview.report" },
+    { "prefix": "/intel radar collect", "intent": "intel.techradar.collect" },
+    { "prefix": "/intel radar report", "intent": "intel.techradar.report" },
+    { "prefix": "/intel query", "intent": "intel.query.search" },
+    { "prefix": "/help", "intent": "general.default" }
+  ]
+}

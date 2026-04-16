@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 ENV_FILE="$PROJECT_DIR/.env"
 
@@ -23,9 +22,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 load_env() {
-  if [[ ! -f "$ENV_FILE" ]]; then
-    echo "ERROR: $ENV_FILE not found"; exit 1
-  fi
+  [[ -f "$ENV_FILE" ]] || return 0
   set -a
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%%#*}"
@@ -41,19 +38,25 @@ load_env() {
 # ---------- individual starters ----------
 
 start_pg() {
-  echo "[PG] Starting PostgreSQL..."
-  sudo pg_ctlcluster 16 main start 2>/dev/null || true
-  echo "[PG] Running on port 5432"
+  if command -v pg_ctlcluster >/dev/null 2>&1; then
+    echo "[PG] Starting PostgreSQL cluster..."
+    sudo pg_ctlcluster 16 main start 2>/dev/null || true
+    echo "[PG] Ready (expected port: 5432)"
+  else
+    echo "[PG] Skip: pg_ctlcluster not found."
+  fi
 }
 
 run_backend() {
   load_env
-  cd "$BACKEND_DIR"
-  source .venv/bin/activate
-  uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload 2>&1 | while IFS= read -r l; do echo "[BE] $l"; done
+  bash "$SCRIPT_DIR/start_backend.sh" 2>&1 | while IFS= read -r l; do echo "[BE] $l"; done
 }
 
 run_frontend() {
+  if [[ ! -f "$FRONTEND_DIR/package.json" ]]; then
+    echo "[FE] Skip: frontend package.json not found."
+    return 0
+  fi
   cd "$FRONTEND_DIR"
   npm run dev -- --hostname 0.0.0.0 --port 3000 2>&1 | while IFS= read -r l; do echo "[FE] $l"; done
 }
@@ -73,10 +76,10 @@ wait_ready() {
   local be_code fe_code i
   echo "[SYS] Waiting for backend/frontend readiness..."
   for i in $(seq 1 120); do
-    be_code="$(http_code "http://127.0.0.1:8010/docs")"
+    be_code="$(http_code "http://127.0.0.1:8010/health")"
     fe_code="$(http_code "http://127.0.0.1:3000")"
-    if [[ "$be_code" == "200" && "$fe_code" == "200" ]]; then
-      echo "[SYS] Services ready: backend=200 frontend=200"
+    if [[ "$be_code" == "200" ]]; then
+      echo "[SYS] Backend ready: backend=200 frontend=$fe_code"
       return 0
     fi
     if (( i % 5 == 0 )); then
@@ -108,12 +111,7 @@ case "$ACTION" in
     start_pg
     ;;
   backend)
-    start_pg
-    load_env
-    echo ""
-    echo "=== Backend (port 8010) | BOSS_HEADLESS=$BOSS_HEADLESS ==="
-    cd "$BACKEND_DIR" && source .venv/bin/activate
-    exec uvicorn app.main:app --host 0.0.0.0 --port 8010 --reload
+    exec bash "$SCRIPT_DIR/start_backend.sh"
     ;;
   frontend)
     echo "=== Frontend (port 3000) ==="
@@ -124,10 +122,10 @@ case "$ACTION" in
     load_env
     echo ""
     echo "=========================================="
-    echo "  OfferPilot — 一键启动"
+    echo "  Pulse — One command startup"
     echo "  Backend:  http://127.0.0.1:8010/docs"
     echo "  Frontend: http://127.0.0.1:3000"
-    echo "  BOSS_HEADLESS = $BOSS_HEADLESS"
+    echo "  PULSE_ENVIRONMENT = ${PULSE_ENVIRONMENT:-dev}"
     echo "  Ctrl+C 停止所有服务"
     echo "=========================================="
     echo ""

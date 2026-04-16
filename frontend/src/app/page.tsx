@@ -72,6 +72,9 @@ const QUICK_LINKS: Array<{ href: string; label: string }> = [
   { href: "#sec-more", label: "更多工具 ▾" },
 ];
 
+const PHASE1_M25_COMPAT_MODE = true;
+const REMOVED_FEATURE_MESSAGE = "该功能已在 M2 清理下线，后续会在 M3+ 以新模块重建。";
+
 type MaterialDraft = {
   resume_bullets: string[];
   cover_letter: string;
@@ -738,8 +741,8 @@ export default function Home() {
   const [pendingFormFills, setPendingFormFills] = useState<FormFillPendingItem[]>([]);
   const [loadingPendingFormFills, setLoadingPendingFormFills] = useState(false);
 
-  const [emailSender, setEmailSender] = useState("hr@offerpilot.ai");
-  const [emailSubject, setEmailSubject] = useState("【OfferPilot】面试邀请：2026-03-20 14:00");
+  const [emailSender, setEmailSender] = useState("hr@pulse-agent.dev");
+  const [emailSubject, setEmailSubject] = useState("【Pulse】面试邀请：2026-03-20 14:00");
   const [emailBody, setEmailBody] = useState(
     "你好，邀请你参加一面，请于2026-03-20 14:00线上面试。",
   );
@@ -768,7 +771,7 @@ export default function Home() {
   const agentLogEndRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
 
-  const [intelCompany, setIntelCompany] = useState("OfferPilot Labs");
+  const [intelCompany, setIntelCompany] = useState("Pulse Labs");
   const [intelRoleTitle, setIntelRoleTitle] = useState("AI Agent Intern");
   const [intelJdText, setIntelJdText] = useState(
     "Need Python, LangGraph, RAG, MCP, Playwright; focus on Agent workflow and delivery.",
@@ -789,7 +792,7 @@ export default function Home() {
   const [issuedToken, setIssuedToken] = useState<SecurityTokenIssueResponse | null>(null);
   const [tokenConsumeResult, setTokenConsumeResult] = useState<SecurityTokenConsumeResponse | null>(null);
   const [tokenLoading, setTokenLoading] = useState(false);
-  const [budgetSessionId, setBudgetSessionId] = useState("offerpilot-demo");
+  const [budgetSessionId, setBudgetSessionId] = useState("pulse-demo");
   const [budgetToolType, setBudgetToolType] = useState("browser");
   const [budgetLimit, setBudgetLimit] = useState(20);
   const [budgetConsume, setBudgetConsume] = useState(1);
@@ -817,19 +820,13 @@ export default function Home() {
 
   const fetchPendingMaterials = async () => {
     setLoadingPendingMaterials(true);
-    setMaterialError(null);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/material/pending`);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as PendingMaterialItem[];
-      setPendingMaterials(data);
-    } catch (error) {
-      setMaterialError(`加载待审批材料失败：${String(error)}`);
-    } finally {
+    setPendingMaterials([]);
+    if (PHASE1_M25_COMPAT_MODE) {
       setLoadingPendingMaterials(false);
+      return;
     }
+    setMaterialError(null);
+    setLoadingPendingMaterials(false);
   };
 
   const fetchCachedProfile = useCallback(async () => {
@@ -846,38 +843,15 @@ export default function Home() {
     setBossPreviewingReply(true);
     setBossChatError(null);
     setBossReplyPreview(null);
-    try {
-      const profile = cachedProfile ?? {};
-      const resp = await fetch(`${API_BASE_URL}/api/boss/chat/reply-preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          hr_message: bossHrMessage,
-          profile_id: "default",
-          profile_override: profile,
-          company: bossHrCompany || null,
-          job_title: bossHrJobTitle || null,
-          notify_on_escalate: bossNotifyOnEscalate,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as BossChatReplyPreviewResponse;
-      setBossReplyPreview(data);
-      await fetchActionTimeline();
-    } catch (error) {
-      setBossChatError(`消息回复预览失败：${String(error)}`);
-    } finally {
-      setBossPreviewingReply(false);
-    }
+    setBossChatError("消息回复预览入口已下线，请使用“批量处理”查看建议。");
+    setBossPreviewingReply(false);
   };
 
   const handleBossChatPull = async () => {
     setBossChatPulling(true);
     setBossChatError(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/boss/chat/pull`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/boss_chat/pull`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -906,7 +880,7 @@ export default function Home() {
     setBossChatProcessSummary(null);
     setBossChatHeartbeatSummary(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/boss/chat/process`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/boss_chat/process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -925,7 +899,7 @@ export default function Home() {
       setBossChatProcessed(data.items ?? []);
       setBossChatScreenshotPath(data.screenshot_path ?? null);
       setBossChatProcessSummary(
-        `会话 ${data.total_conversations}，候选消息 ${data.candidate_messages}，处理 ${data.processed_count}，新增 ${data.new_count}，去重跳过 ${data.duplicated_count}。`,
+        `处理 ${data.processed_count}，新增 ${data.new_count}，去重跳过 ${data.duplicated_count}。`,
       );
       await fetchActionTimeline();
     } catch (error) {
@@ -940,7 +914,7 @@ export default function Home() {
     setBossChatError(null);
     setBossChatHeartbeatSummary(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/boss/chat/heartbeat/trigger`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/boss_chat/process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -949,26 +923,20 @@ export default function Home() {
           profile_id: "default",
           notify_on_escalate: bossNotifyOnEscalate,
           fetch_latest_hr: true,
-          notify_channel_on_hits: false,
           auto_execute: bossChatAutoExecute,
+          chat_tab: "未读",
         }),
       });
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      const data = (await resp.json()) as BossChatHeartbeatTriggerResponse;
-      setBossChatHeartbeatSummary(data.summary || null);
-      setBossChatProcessed(data.process?.items ?? []);
-      setBossChatScreenshotPath(data.process?.screenshot_path ?? null);
-      if (data.ok === false) {
-        setBossChatError(data.error || data.summary || "巡检失败");
-        setBossChatProcessSummary("");
-      } else {
-        setBossChatError(null);
-        setBossChatProcessSummary(
-          `会话 ${data.process.total_conversations}，候选消息 ${data.process.candidate_messages}，处理 ${data.process.processed_count}，新增 ${data.process.new_count}，去重跳过 ${data.process.duplicated_count}。`,
-        );
-      }
+      const data = (await resp.json()) as BossChatProcessResponse;
+      setBossChatHeartbeatSummary("已触发模块化巡检流程（M2.5）。");
+      setBossChatProcessed(data.items ?? []);
+      setBossChatScreenshotPath(data.screenshot_path ?? null);
+      setBossChatProcessSummary(
+        `处理 ${data.processed_count}，新增 ${data.new_count}，去重跳过 ${data.duplicated_count}。`,
+      );
       await fetchActionTimeline();
     } catch (error) {
       setBossChatError(`触发巡检失败：${String(error)}。请先确保 BOSS 已登录并可访问聊天页面。`);
@@ -986,57 +954,26 @@ export default function Home() {
 
   const fetchPendingFormFills = async () => {
     setLoadingPendingFormFills(true);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/form/fill/pending?limit=30`);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as FormFillPendingItem[];
-      setPendingFormFills(data);
-    } catch {
-      // Keep UI resilient: pending list is optional for local demo.
-      setPendingFormFills([]);
-    } finally {
-      setLoadingPendingFormFills(false);
-    }
+    setPendingFormFills([]);
+    setLoadingPendingFormFills(false);
   };
 
   const fetchRecentEmails = async () => {
     setLoadingEmailEvents(true);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/recent?limit=20`);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as EmailEventItem[];
-      setEmailEvents(data);
-    } catch {
-      setEmailEvents([]);
-    } finally {
-      setLoadingEmailEvents(false);
-    }
+    setEmailEvents([]);
+    setLoadingEmailEvents(false);
   };
 
   const fetchUpcomingSchedules = async () => {
     setLoadingSchedules(true);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/schedules/upcoming?limit=20&days=14`);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as ScheduleEventItem[];
-      setUpcomingSchedules(data);
-    } catch {
-      setUpcomingSchedules([]);
-    } finally {
-      setLoadingSchedules(false);
-    }
+    setUpcomingSchedules([]);
+    setLoadingSchedules(false);
   };
 
   const fetchEmailHeartbeatStatus = async () => {
     setLoadingHeartbeatStatus(true);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/heartbeat/status`);
+      const resp = await fetch(`${API_BASE_URL}/api/modules/email_tracker/heartbeat/status`);
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
@@ -1083,69 +1020,14 @@ export default function Home() {
 
   const handleGenerateCompanyIntel = async () => {
     setIntelLoading(true);
-    setIntelError(null);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/company/intel`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          company: intelCompany,
-          role_title: intelRoleTitle || null,
-          jd_text: intelJdText || null,
-          focus_keywords: ["技术栈", "面试流程", "融资"],
-          max_results: 6,
-          include_search: true,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as CompanyIntelResponse;
-      setIntelResult(data);
-      setPrepError(null);
-    } catch (error) {
-      setIntelError(`公司情报生成失败：${String(error)}`);
-    } finally {
-      setIntelLoading(false);
-    }
+    setIntelError(REMOVED_FEATURE_MESSAGE);
+    setIntelLoading(false);
   };
 
   const handleGenerateInterviewPrep = async () => {
     setPrepLoading(true);
-    setPrepError(null);
-    try {
-      const payload = prepJobId.trim()
-        ? {
-            job_id: prepJobId.trim(),
-            use_company_intel: prepUseCompanyIntel,
-            question_count: prepQuestionCount,
-          }
-        : {
-            company: intelCompany,
-            role_title: intelRoleTitle || null,
-            jd_text: intelJdText || null,
-            use_company_intel: prepUseCompanyIntel,
-            question_count: prepQuestionCount,
-          };
-      const resp = await fetch(`${API_BASE_URL}/api/interview/prep`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as InterviewPrepResponse;
-      setPrepResult(data);
-      if (data.company_intel) {
-        setIntelResult(data.company_intel);
-      }
-      await fetchActionTimeline();
-    } catch (error) {
-      setPrepError(`面试题生成失败：${String(error)}`);
-    } finally {
-      setPrepLoading(false);
-    }
+    setPrepError(REMOVED_FEATURE_MESSAGE);
+    setPrepLoading(false);
   };
 
   const handleIssueSecurityToken = async () => {
@@ -1385,33 +1267,8 @@ export default function Home() {
     setMaterialError(null);
     setMaterialMessage(null);
     setMaterialStatus(null);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/material/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          job_id: jobId,
-          resume_version: materialResumeVersion,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as MaterialGenerateResponse;
-      setMaterialJobId(data.job_id);
-      setMaterialThreadId(data.thread_id ?? null);
-      setCurrentResumeVersion(data.resume_version);
-      setMaterialDraft(data.draft ?? null);
-      setPreviousMaterialDraft(null);
-      setMaterialStatus(data.status);
-      setMaterialMessage(data.message ?? null);
-      await loadResumeSourceForDiff(data.resume_version, data.draft ?? null);
-      await fetchPendingMaterials();
-    } catch (error) {
-      setMaterialError(`材料生成失败：${String(error)}`);
-    } finally {
-      setGeneratingMaterial(false);
-    }
+    setMaterialError(REMOVED_FEATURE_MESSAGE);
+    setGeneratingMaterial(false);
   };
 
   const handleGenerateMaterialSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -1438,50 +1295,14 @@ export default function Home() {
   const handleReviewMaterial = async (
     decision: "approve" | "reject" | "regenerate",
   ) => {
+    void decision;
     if (!materialThreadId) {
       setMaterialError("当前没有待审批 thread_id。");
       return;
     }
     setReviewingMaterial(true);
-    setMaterialError(null);
-    const snapshotBeforeReview = materialDraft;
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/material/review`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_id: materialThreadId,
-          decision,
-          feedback: materialFeedback || null,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as MaterialReviewResponse;
-      setMaterialStatus(data.status);
-      setMaterialMessage(data.message);
-      if (data.draft) {
-        if (decision === "regenerate" && snapshotBeforeReview) {
-          setPreviousMaterialDraft(snapshotBeforeReview);
-        }
-        setMaterialDraft(data.draft);
-        await loadResumeSourceForDiff(currentResumeVersion, data.draft);
-      }
-      if (data.status === "rejected") {
-        setMaterialThreadId(null);
-        setMaterialDraft(null);
-        setPreviousMaterialDraft(null);
-        setResumeDiffRows([]);
-      }
-      setMaterialFeedback("");
-      await fetchPendingMaterials();
-      await fetchRecentJobs();
-    } catch (error) {
-      setMaterialError(`材料审批失败：${String(error)}`);
-    } finally {
-      setReviewingMaterial(false);
-    }
+    setMaterialError(REMOVED_FEATURE_MESSAGE);
+    setReviewingMaterial(false);
   };
 
   const copyText = async (text: string, label: string) => {
@@ -1495,42 +1316,14 @@ export default function Home() {
   };
 
   const handleExportMaterial = async (format: "pdf" | "txt") => {
+    void format;
     if (!materialThreadId) {
       setMaterialError("没有可导出的 thread_id。");
       return;
     }
     setExportingMaterial(true);
-    setMaterialError(null);
-    try {
-      const detailResp = await fetch(`${API_BASE_URL}/api/material/thread/${materialThreadId}`);
-      if (!detailResp.ok) {
-        throw new Error(`HTTP ${detailResp.status}`);
-      }
-      const detail = (await detailResp.json()) as MaterialThreadDetail;
-      if (detail.status !== "approved") {
-        setMaterialError("请先 Approve，再导出。");
-        return;
-      }
-
-      const resp = await fetch(`${API_BASE_URL}/api/material/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_id: materialThreadId,
-          format,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as MaterialExportResponse;
-      setMaterialMessage(`导出成功：${data.file_name}`);
-      window.open(`${API_BASE_URL}${data.download_url}`, "_blank");
-    } catch (error) {
-      setMaterialError(`导出失败：${String(error)}`);
-    } finally {
-      setExportingMaterial(false);
-    }
+    setMaterialError(REMOVED_FEATURE_MESSAGE);
+    setExportingMaterial(false);
   };
 
   const handleBossScan = async (event: FormEvent<HTMLFormElement>) => {
@@ -1539,7 +1332,7 @@ export default function Home() {
     setBossError(null);
     setBossPagesScanned(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/boss/scan`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/boss_greet/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1570,54 +1363,14 @@ export default function Home() {
   const handleAutofillPreview = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setAutofillLoading(true);
-    setAutofillError(null);
-    try {
-      const profile = parseAutofillProfile();
-      const resp = await fetch(`${API_BASE_URL}/api/form/autofill/preview`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          html: autofillHtml,
-          profile,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as AutofillPreviewResponse;
-      setAutofillPreview(data);
-      setAutofillFillResult(null);
-    } catch (error) {
-      setAutofillError(`Autofill 预览失败：${String(error)}`);
-    } finally {
-      setAutofillLoading(false);
-    }
+    setAutofillError(REMOVED_FEATURE_MESSAGE);
+    setAutofillLoading(false);
   };
 
   const handleAutofillUrlPreview = async () => {
     setAutofillUrlPreviewing(true);
-    setAutofillError(null);
-    try {
-      const profile = parseAutofillProfile();
-      const resp = await fetch(`${API_BASE_URL}/api/form/autofill/preview-url`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: autofillTargetUrl,
-          profile,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as AutofillPreviewResponse;
-      setAutofillPreview(data);
-      setAutofillFillResult(null);
-    } catch (error) {
-      setAutofillError(`URL 预览失败：${String(error)}`);
-    } finally {
-      setAutofillUrlPreviewing(false);
-    }
+    setAutofillError(REMOVED_FEATURE_MESSAGE);
+    setAutofillUrlPreviewing(false);
   };
 
   const handleAutofillFillUrl = async () => {
@@ -1626,138 +1379,31 @@ export default function Home() {
       return;
     }
     setAutofillFilling(true);
-    setAutofillError(null);
-    try {
-      const profile = parseAutofillProfile();
-      const resp = await fetch(`${API_BASE_URL}/api/form/autofill/fill-url`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: autofillTargetUrl,
-          profile,
-          confirm_fill: true,
-          max_actions: 20,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as AutofillFillResponse;
-      setAutofillFillResult(data);
-    } catch (error) {
-      setAutofillError(`URL 自动填充失败：${String(error)}`);
-    } finally {
-      setAutofillFilling(false);
-    }
+    setAutofillError(REMOVED_FEATURE_MESSAGE);
+    setAutofillFilling(false);
   };
 
   const handleStartFormFillWorkflow = async () => {
     setStartingFormFill(true);
-    setAutofillError(null);
-    try {
-      const profile = parseAutofillProfile();
-      const resp = await fetch(`${API_BASE_URL}/api/form/fill/start`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: autofillTargetUrl,
-          profile,
-          max_actions: 20,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as FormFillStartResponse;
-      setFormFillThreadId(data.thread_id);
-      setFormFillStatus(data.status);
-      setFormFillMessage(data.message ?? "预览完成，等待审批");
-      setAutofillPreview({
-        url: data.url,
-        total_fields: data.preview.total_fields,
-        mapped_fields: data.preview.mapped_fields,
-        screenshot_path: data.preview.screenshot_path ?? null,
-        fields: data.preview.fields,
-      });
-      setAutofillFillResult(null);
-      await fetchPendingFormFills();
-    } catch (error) {
-      setAutofillError(`启动审批流失败：${String(error)}`);
-    } finally {
-      setStartingFormFill(false);
-    }
+    setAutofillError(REMOVED_FEATURE_MESSAGE);
+    setStartingFormFill(false);
   };
 
   const handleReviewFormFill = async (decision: "approve" | "reject") => {
+    void decision;
     if (!formFillThreadId) {
       setAutofillError("当前没有可审批的 form fill thread。");
       return;
     }
     setReviewingFormFill(true);
-    setAutofillError(null);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/form/fill/review`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          thread_id: formFillThreadId,
-          decision,
-          feedback: autofillReviewFeedback || null,
-          max_actions: 20,
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as FormFillReviewResponse;
-      setFormFillStatus(data.status);
-      setFormFillMessage(data.message);
-      if (data.preview) {
-        setAutofillPreview({
-          url: autofillTargetUrl,
-          total_fields: data.preview.total_fields,
-          mapped_fields: data.preview.mapped_fields,
-          screenshot_path: data.preview.screenshot_path ?? null,
-          fields: data.preview.fields,
-        });
-      }
-      if (data.fill_result) {
-        setAutofillFillResult(data.fill_result);
-      }
-      setAutofillReviewFeedback("");
-      await fetchPendingFormFills();
-    } catch (error) {
-      setAutofillError(`审批失败：${String(error)}`);
-    } finally {
-      setReviewingFormFill(false);
-    }
+    setAutofillError(REMOVED_FEATURE_MESSAGE);
+    setReviewingFormFill(false);
   };
 
   const loadFormFillThread = async (threadId: string) => {
+    void threadId;
     setAutofillError(null);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/form/fill/thread/${encodeURIComponent(threadId)}`);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as FormFillThreadDetail;
-      setFormFillThreadId(data.thread_id);
-      setFormFillStatus(data.status);
-      setFormFillMessage(`已载入 thread: ${data.thread_id}`);
-      setAutofillTargetUrl(data.url);
-      if (data.preview) {
-        setAutofillPreview({
-          url: data.url,
-          total_fields: data.preview.total_fields,
-          mapped_fields: data.preview.mapped_fields,
-          screenshot_path: data.preview.screenshot_path ?? null,
-          fields: data.preview.fields,
-        });
-      }
-      setAutofillFillResult(data.fill_result ?? null);
-    } catch (error) {
-      setAutofillError(`载入线程失败：${String(error)}`);
-    }
+    setAutofillError(REMOVED_FEATURE_MESSAGE);
   };
 
   const handleIngestEmail = async (event: FormEvent<HTMLFormElement>) => {
@@ -1765,7 +1411,7 @@ export default function Home() {
     setIngestingEmail(true);
     setEmailError(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/ingest`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/email_tracker/process-one`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1777,8 +1423,19 @@ export default function Home() {
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      const data = (await resp.json()) as EmailIngestResponse;
-      setEmailResult(data);
+      const data = (await resp.json()) as {
+        classification: EmailClassification;
+        related_job_id?: string | null;
+        updated_job_status?: string | null;
+      };
+      setEmailResult({
+        email_id: `local-${Date.now()}`,
+        classification: data.classification,
+        related_job_id: data.related_job_id ?? null,
+        updated_job_status: data.updated_job_status ?? null,
+        schedule_event_id: null,
+        message: "已通过 email_tracker/process-one 处理",
+      });
       await fetchRecentEmails();
       await fetchUpcomingSchedules();
       await fetchRecentJobs();
@@ -1794,7 +1451,7 @@ export default function Home() {
     setEmailError(null);
     setEmailFetchMessage(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/fetch`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/email_tracker/fetch-process`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ max_items: 10, mark_seen: false }),
@@ -1819,14 +1476,22 @@ export default function Home() {
     setEmailError(null);
     setEmailFetchMessage(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/heartbeat/${action}`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/email_tracker/heartbeat/${action}`, {
         method: "POST",
       });
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      const data = (await resp.json()) as EmailHeartbeatControlResponse;
-      setEmailFetchMessage(data.message);
+      const data = (await resp.json()) as {
+        ok: boolean;
+        started?: boolean;
+        stopped?: boolean;
+      };
+      setEmailFetchMessage(
+        action === "start"
+          ? (data.started ? "Heartbeat 已启动。" : "Heartbeat 已在运行。")
+          : (data.stopped ? "Heartbeat 已停止。" : "Heartbeat 当前未运行。"),
+      );
       await fetchEmailHeartbeatStatus();
     } catch (error) {
       setEmailError(`Heartbeat ${action} 失败：${String(error)}`);
@@ -1840,19 +1505,16 @@ export default function Home() {
     setEmailError(null);
     setEmailFetchMessage(null);
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/heartbeat/trigger`, {
+      const resp = await fetch(`${API_BASE_URL}/api/modules/email_tracker/heartbeat/trigger`, {
         method: "POST",
       });
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      const data = (await resp.json()) as EmailHeartbeatTriggerResponse;
-      const notifyText = data.notification_sent
-        ? "已发送通道通知"
-        : `未发送通道通知（${data.notification_error || "no updates"}）`;
-      setEmailFetchMessage(
-        `${data.message}：抓取 ${data.fetched_count} 封，处理 ${data.processed_count} 封，提醒 ${data.schedule_reminders} 条，未来日程 ${data.upcoming_schedules} 条；${notifyText}。`,
-      );
+      const data = (await resp.json()) as { ok: boolean; result?: EmailFetchResponse };
+      const fetched = data.result?.fetched_count ?? 0;
+      const processed = data.result?.processed_count ?? 0;
+      setEmailFetchMessage(`Heartbeat 手动触发完成：抓取 ${fetched} 封，处理 ${processed} 封。`);
       await fetchRecentEmails();
       await fetchUpcomingSchedules();
       await fetchRecentJobs();
@@ -1868,28 +1530,8 @@ export default function Home() {
     setTestingNotify(true);
     setEmailError(null);
     setEmailFetchMessage(null);
-    try {
-      const resp = await fetch(`${API_BASE_URL}/api/email/heartbeat/notify-test`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: "OfferPilot 测试通知：邮件巡检通道联动正常。",
-        }),
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data = (await resp.json()) as { sent: boolean; error?: string | null };
-      if (data.sent) {
-        setEmailFetchMessage("测试通知发送成功。");
-      } else {
-        setEmailError(`测试通知发送失败：${data.error || "unknown error"}`);
-      }
-    } catch (error) {
-      setEmailError(`测试通知失败：${String(error)}`);
-    } finally {
-      setTestingNotify(false);
-    }
+    setEmailError(REMOVED_FEATURE_MESSAGE);
+    setTestingNotify(false);
   };
 
   const jobKanban = JOB_KANBAN_COLUMNS.reduce(
@@ -1907,7 +1549,7 @@ export default function Home() {
   return (
     <main className="mx-auto min-h-screen max-w-6xl p-4 sm:p-6 md:p-10">
       <header className="mb-8 space-y-2">
-        <h1 className="text-2xl font-bold sm:text-3xl">OfferPilot 求职助手</h1>
+        <h1 className="text-2xl font-bold sm:text-3xl">Pulse Agent</h1>
         <p className="text-sm text-zinc-600">
           当前后端：
           <code className="rounded bg-zinc-100 px-2 py-1 text-xs">

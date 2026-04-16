@@ -3,10 +3,10 @@ set -euo pipefail
 
 ACTION="${1:-install}"
 
-EMAIL_JOB_NAME="${OFP_EMAIL_JOB_NAME:-offerpilot-email-daily-heartbeat}"
-BOSS_JOB_NAME="${OFP_BOSS_JOB_NAME:-offerpilot-boss-daily-scan}"
-BOSS_CHAT_JOB_NAME="${OFP_BOSS_CHAT_JOB_NAME:-offerpilot-boss-chat-copilot}"
-HOURLY_JOB_NAME="${OFP_HOURLY_JOB_NAME:-offerpilot-hourly-heartbeat-test}"
+EMAIL_JOB_NAME="${OFP_EMAIL_JOB_NAME:-pulse-email-daily-heartbeat}"
+BOSS_JOB_NAME="${OFP_BOSS_JOB_NAME:-pulse-boss-daily-scan}"
+BOSS_CHAT_JOB_NAME="${OFP_BOSS_CHAT_JOB_NAME:-pulse-boss-chat-copilot}"
+HOURLY_JOB_NAME="${OFP_HOURLY_JOB_NAME:-pulse-hourly-heartbeat-test}"
 
 TZ_NAME="${OFP_TZ:-}"
 TZ_SOURCE="env"
@@ -188,7 +188,7 @@ remove_jobs() {
   remove_job_if_exists "$BOSS_JOB_NAME"
   remove_job_if_exists "$BOSS_CHAT_JOB_NAME"
   remove_job_if_exists "$HOURLY_JOB_NAME"
-  echo "Removed configured OfferPilot cron jobs."
+  echo "Removed configured Pulse cron jobs."
   print_status
 }
 

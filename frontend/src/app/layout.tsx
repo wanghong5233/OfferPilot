@@ -13,9 +13,9 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "OfferPilot Dashboard",
+  title: "Pulse Dashboard",
   description:
-    "OfferPilot dashboard for JD analysis, company intel, interview prep, security guardrails, and full workflow demos",
+    "Pulse personal AI agent — brain, memory, evolution, and modular capabilities",
 };
 
 export default function RootLayout({

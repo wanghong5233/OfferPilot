@@ -27,11 +27,21 @@ def _profile_dir() -> Path:
     return (Path(__file__).resolve().parents[1] / ".playwright" / "boss_mcp").resolve()
 
 
-def _screenshot_dir() -> Path:
-    configured = os.getenv("BOSS_SCREENSHOT_DIR", "").strip()
+def _screenshot_dir() -> Path | None:
+    configured = os.getenv("BOSS_SCREENSHOT_DIR", "").strip() or os.getenv(
+        "BROWSER_USE_SCREENSHOT_DIR", ""
+    ).strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    return (Path(__file__).resolve().parents[1] / "exports" / "screenshots").resolve()
+    enabled = os.getenv("BROWSER_USE_SCREENSHOTS_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return None
+    return (Path(__file__).resolve().parents[1] / "logs" / "browser_use_screenshots").resolve()
 
 
 def _ensure_page():
@@ -48,7 +58,9 @@ def _ensure_page():
 
         profile_dir = _profile_dir()
         profile_dir.mkdir(parents=True, exist_ok=True)
-        _screenshot_dir().mkdir(parents=True, exist_ok=True)
+        shot_dir = _screenshot_dir()
+        if shot_dir is not None:
+            shot_dir.mkdir(parents=True, exist_ok=True)
 
         if _PLAYWRIGHT_MANAGER is None:
             _PLAYWRIGHT_MANAGER = sync_playwright()
@@ -96,6 +108,8 @@ def screenshot(name: str = "") -> str:
     """Capture a screenshot and return file path."""
     page = _ensure_page()
     shot_dir = _screenshot_dir()
+    if shot_dir is None:
+        return "screenshot disabled: set BROWSER_USE_SCREENSHOTS_ENABLED=true or BROWSER_USE_SCREENSHOT_DIR"
     shot_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in name).strip("_")

@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODE="${1:-dry-run}" # dry-run | publish
 BUMP_TYPE="${CLAWHUB_BUMP_TYPE:-patch}" # patch | minor | major
-CHANGELOG="${CLAWHUB_CHANGELOG:-OfferPilot phase-6 update}"
+CHANGELOG="${CLAWHUB_CHANGELOG:-Pulse capability update}"
 TAGS="${CLAWHUB_TAGS:-latest}"
 FORCE_FALLBACK_SKILLS="${CLAWHUB_FORCE_FALLBACK_SKILLS:-interview-prep}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -271,7 +271,7 @@ if [[ -z "$OWNER_HANDLE" ]]; then
   exit 1
 fi
 
-FALLBACK_PREFIX="${CLAWHUB_FALLBACK_PREFIX:-${OWNER_HANDLE}-offerpilot}"
+FALLBACK_PREFIX="${CLAWHUB_FALLBACK_PREFIX:-${OWNER_HANDLE}-pulse}"
 echo "Using fallback slug prefix: $FALLBACK_PREFIX"
 echo "Version bump mode: $BUMP_TYPE"
 echo "Force fallback skills: $FORCE_FALLBACK_SKILLS"
