@@ -1,7 +1,7 @@
 <h1 align="center">Pulse</h1>
 
 <p align="center">
-  <strong>开源的"钢铁侠贾维斯" —— 一个会长期陪你、越用越懂你的个人 AI 助手</strong>
+  <strong>开源的长驻个人 AI 助手 · 持久记忆 · 主动执行 · 内核 + 技能包架构</strong>
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@
 
 ## Pulse 是什么
 
-Pulse 是一个**部署在你自己机器上的个人 AI 助手** —— 目标是成为一个长期驻留、真正理解你、帮你承担日常琐事的贾维斯。
+Pulse 是一个**部署在你自己机器上的个人 AI 助手** —— 长期驻留、真正理解你、帮你承担日常琐事。目标是做一个"你自己的 JARVIS":不是一次性的对话机器人,而是一个会主动执行、持续学习、越用越懂你的长驻系统。
 
 为了做到这一点,Pulse 把一个通用的 **Agent 内核**和按领域挂载的**业务技能包**彻底分离:
 
@@ -79,7 +79,7 @@ Pulse 想做的是"**把 Agent 从对话窗口中解耦出来,成为一个长期
 |---|---|---|
 | **Agent OS 内核** | `AgentRuntime` 长驻,patrol 任务自注册,active hours + 熔断 + 事件总线 | ✅ |
 | **ReAct 推理 + 三环工具** | Brain 推理循环 · Ring1 内置工具 · Ring2 Module · Ring3 外部 MCP | ✅ |
-| **三契约工具调用** | Description(`when_to_use`) + Call(`tool_choice`) + Execution Verifier(commitment 审查) | ✅ v2.1 |
+| **三契约工具调用** | Description(`when_to_use`) + Call(`tool_choice`) + Execution Verifier(commitment 审查) | ✅ |
 | **五层记忆系统** | Operational / Recall / Workspace / Archival / Core + Layer × Scope 双轴 | ✅ |
 | **Observability Plane** | 独立事件总线 + 按天滚动 JSONL 审计 + in-memory 滑窗 + SSE 实时流 | ✅ |
 | **MCP Server + Client** | 内置 Tool 即 MCP Tool,对外被 Claude Desktop / Cursor 等直连;对内也接入外部 MCP | ✅ |

@@ -1,7 +1,7 @@
 <h1 align="center">Pulse</h1>
 
 <p align="center">
-  <strong>Open-source “Iron Man JARVIS” — a personal AI assistant that stays with you and knows you better over time</strong>
+  <strong>Open-source long-running personal AI assistant &middot; persistent memory &middot; proactive execution &middot; kernel + skill-pack architecture</strong>
 </p>
 
 <p align="center">
@@ -39,7 +39,7 @@
 
 ## What is Pulse
 
-Pulse is a **personal AI assistant that runs on your own machine** — built to become a JARVIS that stays online, truly understands you, and takes the busywork off your plate.
+Pulse is a **personal AI assistant that runs on your own machine** — long-lived, truly understanding of you, and takes busywork off your plate. The goal is a "JARVIS of your own": not a one-shot chatbot, but a long-running system that executes proactively, keeps learning, and grows to understand you over time.
 
 To do that, Pulse cleanly separates a generic **agent kernel** from **domain skill packs** you plug in by area:
 
@@ -80,7 +80,7 @@ Pulse aims to **decouple the agent from the chat window and turn it into an assi
 |---|---|---|
 | **Agent OS kernel** | Long-lived `AgentRuntime`, self-registering patrol tasks, active hours + circuit breaking + event bus | ✅ |
 | **ReAct + three-ring tools** | Brain loop · Ring 1 built-ins · Ring 2 modules · Ring 3 external MCP | ✅ |
-| **Three-contract tool use** | Description (`when_to_use`) + Call (`tool_choice`) + Execution Verifier (commitment audit) | ✅ v2.1 |
+| **Three-contract tool use** | Description (`when_to_use`) + Call (`tool_choice`) + Execution Verifier (commitment audit) | ✅ |
 | **Five-layer memory** | Operational / Recall / Workspace / Archival / Core + Layer × Scope | ✅ |
 | **Observability plane** | Standalone event bus + daily-rotating JSONL audit + in-memory sliding window + SSE live stream | ✅ |
 | **MCP Server + Client** | Built-in tools are MCP tools for Claude Desktop / Cursor; internal side also consumes external MCP | ✅ |
