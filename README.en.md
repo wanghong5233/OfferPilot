@@ -23,14 +23,16 @@
   <img src="https://img.shields.io/badge/MCP-Server%20%26%20Client-8A2BE2" alt="MCP" />
   <img src="https://img.shields.io/badge/LLM-OpenAI%20%7C%20Qwen3--Max-orange" alt="LLM" />
   <img src="https://img.shields.io/badge/Browser-Patchright%20CDP%20Stealth-FF6A00" alt="Patchright" />
-  <img src="https://img.shields.io/badge/Milestone-M0--M8%20%E2%9C%93-success" alt="Milestone" />
+  <img src="https://img.shields.io/badge/Status-Alpha%20%E2%80%A2%20usable-2ea44f" alt="Status" />
+  <img src="https://img.shields.io/badge/PRs-welcome-ff69b4" alt="PRs welcome" />
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License" />
 </p>
 
 <p align="center">
-  Keywords: <code>AI Agent</code> · <code>Personal AI Assistant</code> · <code>JARVIS</code> · <code>Self-Evolving Agent</code> ·
-  <code>ReAct</code> · <code>Tool Use Contract</code> · <code>Agent Memory</code> ·
-  <code>Model Context Protocol (MCP)</code> · <code>Patrol / Heartbeat</code>
+  Keywords: <code>AI Agent</code> · <code>Personal AI Assistant</code> · <code>Self-Hosted AI</code> · <code>JARVIS</code> ·
+  <code>Self-Evolving Agent</code> · <code>ReAct</code> · <code>Tool Use Contract</code> · <code>Agent Memory</code> ·
+  <code>Model Context Protocol (MCP)</code> · <code>Agent Skill Pack</code> ·
+  <code>Game Automation</code> · <code>Life Assistant</code> · <code>Patrol / Heartbeat</code>
 </p>
 
 ---
@@ -46,7 +48,7 @@ To do that, Pulse cleanly separates a generic **agent kernel** from **domain ski
 - **The first shipped skill pack is job search** — BOSS Zhipin JD scanning, proactive outreach, auto-replies in HR chats, resume delivery, and email tracking end-to-end.
 - **The real technical depth** sits in three places — three-contract tool use (against agent hallucination), Layer × Scope five-layer memory, and the long-running `AgentRuntime` kernel (patrol + circuit breaking + event bus).
 
-Job search is only the first scenario. Once the kernel stabilizes, weather, travel planning, company research, auto check-ins, and even agents that grow new skills will all run on the same core.
+Job search is only the first scenario. Once the kernel stabilizes, **every life workflow worth automating becomes Pulse's next destination** — automating daily game check-ins, generating end-to-end travel plans, tracking inbox and finance, orchestrating smart-home devices, even synthesizing new skills and accumulating habits and preferences uniquely yours. One kernel, an unbounded set of skill packs.
 
 ---
 
@@ -57,18 +59,18 @@ Today’s agent projects fall into three buckets, each with sharp pain points:
 | Kind | Examples | Pain |
 |---|---|---|
 | Vertical automation scripts | BOSS / résumé / e-commerce bots | Rewrite per scenario; little reuse |
-| Agent frameworks | LangChain / LangGraph / AutoGen | A toolbox, not a product — you still build from zero |
+| Agent frameworks | LangChain / LangGraph / AutoGen | Focused on orchestrating one request; still need a layer of product glue to become **your** long-running AI assistant |
 | Chat assistants | ChatGPT / Claude Desktop | No long-lived presence, no scheduled patrols, no durable memory or closed business loops |
 
-Pulse aims to **pull the agent out of the chat window and turn it into an assistant that stays with you**:
+Pulse aims to **decouple the agent from the chat window and turn it into an assistant that stays with you long-term**:
 
-- **Proactive work**: `AgentRuntime` stays in the background, patrolling for new messages and scheduled intel during work hours — no manual refresh.
-- **Real memory**: Layer × Scope dual-axis memory remembers who you are, which companies you dislike, and where you left off across sessions — not a reset every turn.
-- **No fake moves**: The three-contract architecture (ADR-001) pins “the LLM promised a tool call but never called one”-style hallucinations to an observable event stream.
+- **Proactive execution**: `AgentRuntime` stays in the background, patrolling for new messages and scheduled intel during work hours — no manual refresh required.
+- **Persistent memory**: Layer × Scope dual-axis memory preserves user profile, preferences, and context across sessions — no reset between turns.
+- **Verifiable commitments**: The three-contract architecture (ADR-001) constrains "the LLM claimed a tool call but never issued one"-style hallucinations to an observable event stream.
 - **Ecosystem fit**: MCP Server outward, MCP Client inward — plug-and-play with Claude Desktop, Cursor, or any MCP client.
-- **Growing new skills**: Skill Generator turns natural language into AST-checked, sandbox-tested tools hot-loaded into the registry.
+- **Self-extensible**: Skill Generator turns natural-language requirements into AST-validated, sandbox-tested tools that hot-load into the registry.
 
-> “Agent OS” is not marketing fluff. `core/` really has a scheduling kernel (`core/runtime.py`), process isolation, an event bus, circuit breaking, and patrol lifecycle — and `core/` **must not contain any business vocabulary** (BOSS / résumé / job search). That is a hard architectural rule.
+> "Agent OS" is not a marketing label. `core/` implements an actual scheduling kernel (`core/runtime.py`), process isolation, an event bus, circuit breaking, and a patrol lifecycle — and `core/` **must not contain any business vocabulary** (BOSS / résumé / job search), enforced as a lint rule.
 
 ---
 
@@ -76,17 +78,17 @@ Pulse aims to **pull the agent out of the chat window and turn it into an assist
 
 | Capability | Description | Status |
 |---|---|---|
-| **Agent OS kernel** | Long-lived `AgentRuntime`, self-registering patrol tasks, active hours + circuit breaking + event bus | ✅ M0–M3 |
-| **ReAct + three-ring tools** | Brain loop · Ring 1 built-ins · Ring 2 modules · Ring 3 external MCP | ✅ M4 |
-| **Three-contract tool use** | Description (`when_to_use`) + Call (`tool_choice`) + Execution Verifier (commitment audit) | ✅ A · ✅ B · ✅ C v2.1 |
-| **Five-layer memory** | Operational / Recall / Workspace / Archival / Core + Layer × Scope | ✅ M5 |
+| **Agent OS kernel** | Long-lived `AgentRuntime`, self-registering patrol tasks, active hours + circuit breaking + event bus | ✅ |
+| **ReAct + three-ring tools** | Brain loop · Ring 1 built-ins · Ring 2 modules · Ring 3 external MCP | ✅ |
+| **Three-contract tool use** | Description (`when_to_use`) + Call (`tool_choice`) + Execution Verifier (commitment audit) | ✅ v2.1 |
+| **Five-layer memory** | Operational / Recall / Workspace / Archival / Core + Layer × Scope | ✅ |
 | **Observability plane** | Standalone event bus + daily-rotating JSONL audit + in-memory sliding window + SSE live stream | ✅ |
 | **MCP Server + Client** | Built-in tools are MCP tools for Claude Desktop / Cursor; internal side also consumes external MCP | ✅ |
-| **Skill Generator** | Natural language → code → AST allowlist → sandbox → hot load | ✅ M6 |
-| **Self-evolution engine** | SOUL `[CORE]` / `[MUTABLE]` tiers · Autonomous / Supervised / Gated governance · preference learning Track A · DPO collection Track B | ✅ M7 |
+| **Skill Generator** | Natural language → code → AST allowlist → sandbox → hot load | ✅ |
+| **Self-evolution engine** | SOUL `[CORE]` / `[MUTABLE]` tiers · Autonomous / Supervised / Gated governance · preference learning Track A · DPO collection Track B | ✅ |
 | **Browser automation** | Patchright (Playwright fork, CDP anti-fingerprinting), validated on BOSS Zhipin | ✅ |
 | **Multi-channel ingress** | HTTP / SSE / CLI / Feishu · intent routing exact → prefix → LLM | ✅ |
-| **HITL governance** | Policy Engine L0–L5 gates · approval / rollback / versioned rules + diff | ✅ M7 |
+| **HITL governance** | Policy Engine L0–L5 gates · approval / rollback / versioned rules + diff | ✅ |
 
 ---
 
@@ -139,7 +141,7 @@ Pulse aims to **pull the agent out of the chat window and turn it into an assist
 
 ### Five kernel layers (`docs/Pulse-内核架构总览.md`)
 
-| Layer | Owns | Must not leak in | Shipped |
+| Layer | Responsibility | Out of scope | Status |
 |---|---|---|---|
 | **Agent OS** | Long-run patrol scheduling, active hours, circuit breaking, event fan-out | prompt assembly, fact promotion, user-pref writes | ✅ |
 | **Task Runtime** | Single-turn state machine, tool loop, hooks, budget, stop reason, three contracts | cron scheduling, long-term fact schemas | ✅ |
@@ -151,11 +153,11 @@ Pulse aims to **pull the agent out of the chat window and turn it into an assist
 
 ## Three pillars of the agent kernel
 
-This is where Pulse is more than “another LangChain agent wrapper.” Each pillar has its own ADR / design doc — not vaporware.
+This is where Pulse differentiates itself from "yet another LangChain agent wrapper". Each pillar is backed by an independent ADR / design doc — not a placeholder.
 
 ### 1. ToolUseContract — three orthogonal contracts against agent hallucination
 
-**Problem**: The most common agent bug is not a broken tool — it’s the LLM **saying** it did something without **calling** a tool (e.g. “I saved your preference” while `tool_calls=[]` and memory is empty). Prompt-only guardrails fail in messy conversations.
+**Problem**: The most common agent bug is not a broken tool — it is the LLM **claiming** an action without **invoking** a tool (e.g. "I saved your preference" while `tool_calls=[]` and memory remains empty). Prompt-only guardrails inevitably fail in complex multi-turn conversations.
 
 **Pulse’s answer** ([ADR-001](./docs/adr/ADR-001-ToolUseContract.md)): three orthogonal contracts; if one slips, the next layer catches it.
 
@@ -163,11 +165,11 @@ This is where Pulse is more than “another LangChain agent wrapper.” Each pil
 |---|---|---|
 | **A. Description** | `ToolSpec.when_to_use / when_not_to_use` + PromptContract three-part rendering + counter-example few-shots | Turns “guess which tool” into “tools declare their preconditions” |
 | **B. Call** | `LLMRouter.invoke_chat(tool_choice=...)` + structured ReAct-step escalation + hand-off | On a “text-only, empty tool” turn, escalate to `tool_choice="required"`; pass `scan_handle` between tools to reuse results |
-| **C. Execution Verifier** | Before reply, LLM self-audit `commitment vs used_tools`; on mismatch, rewrite honestly + emit `brain.commitment.unfulfilled` to audit | Catches edge cases where A and B both fail — no bluffing the user |
+| **C. Execution Verifier** | Before reply, LLM self-audits `commitment vs used_tools`; on mismatch, rewrites to an honest statement + emits `brain.commitment.unfulfilled` to audit | Catches edge cases where A and B both fail — unfulfilled commitments are rewritten to truthful statements, eliminating user-facing bluffs |
 
 **Invariant**: semantic judgment stays with the LLM; structural judgment stays in Python. The host **must not** regex/keyword-match user intent to force tool calls.
 
-Every contract failure is driven by real traces (ADR lists production cases like `trace_e48a6be0c90e / 16e97afe3ffc / 4890841c2322`). These defenses were **hardened by production bugs**.
+Every contract is introduced in response to real production traces (the ADR records cases such as `trace_e48a6be0c90e / 16e97afe3ffc / 4890841c2322`). These defenses have been **hardened by real production incidents**.
 
 ### 2. Layer × Scope dual-axis memory
 
@@ -191,13 +193,13 @@ Mainstream agent memory is often “core + vector search,” stuffing everything
 
 ### 3. AgentRuntime — OS-grade long-horizon drive
 
-The kernel that keeps Pulse “awake” in the background. Not just `cron` + `while True`.
+The kernel that keeps Pulse running continuously in the background — substantially more than `cron` + `while True`.
 
 - **Self-registration**: any module calls `register_patrol(...)` in `on_startup`; the kernel imports no business modules.
-- **active hours**: weekdays 9–22, weekends 10–20 — more frequent patrols when active, deep sleep at night — avoids BOSS risk control at 3am.
-- **Conversational control plane** ([ADR-004](./docs/adr/ADR-004-AutoReplyContract.md) §6.1): via IM — “what patrol tasks are running?”, “turn off BOSS auto-reply” — no admin UI required. `system.patrol.*` IntentSpec exposes `list / status / enable / disable / trigger`.
+- **Active hours**: weekdays 9–22, weekends 10–20 — elevated patrol frequency when active, quiesced at night — avoids triggering BOSS risk control during off-hours.
+- **Conversational control plane** ([ADR-004](./docs/adr/ADR-004-AutoReplyContract.md) §6.1): control via IM commands ("list running patrol tasks", "disable BOSS auto-reply") — no admin UI required. `system.patrol.*` IntentSpec exposes `list / status / enable / disable / trigger`.
 - **Circuit breaking + recovery ladder**: `retry` / `degrade` / `skip` / `abort` / `rollback` / `circuitBreak` / `manualTakeover`.
-- **Observability plane is separate**: every layer publishes via `EventBus.publish`; default subscribers: `InMemoryEventStore` (2000-event window for WS/SSE) + `JsonlEventSink` (daily rotation, persists `llm./tool./memory./policy./promotion.*` prefixes only).
+- **Observability plane is decoupled**: every layer publishes via `EventBus.publish`; default subscribers: `InMemoryEventStore` (2000-event sliding window for WS/SSE) + `JsonlEventSink` (daily rotation, persists only `llm./tool./memory./policy./promotion.*` prefixes).
 
 ---
 
@@ -314,7 +316,7 @@ PULSE_JOB_PATROL_GREET_ENABLED=true
 PULSE_JOB_PATROL_CHAT_ENABLED=true
 AGENT_RUNTIME_ENABLED=true
 
-# After restart, AgentRuntime enters active hours; peak patrol ~15 min
+# After restart, AgentRuntime enters active hours; one patrol every 15 minutes during peak window
 ```
 
 ### Claude Desktop / Cursor (as MCP Server)
@@ -407,27 +409,7 @@ Pulse/
 | Storage | **PostgreSQL** | App data + Recall + Workspace + Archival + audit |
 | Persona / core memory | YAML + JSON | Human-readable; version + governance rollback |
 | Observability | EventBus + JSONL + InMemoryEventStore | Separate plane from memory |
-| Deploy | single Python process · Docker Compose | No K8s required |
-
----
-
-## Implementation milestones
-
-Pulse ships **a runnable system at every milestone**. Current status:
-
-| Milestone | Scope | Status |
-|---|---|---|
-| M0 | Skeleton · module system · EventBus | ✅ |
-| M1 | Capability extraction (LLM/Storage/Browser/Scheduler/Notify) | ✅ |
-| M2 | Module migration · V1 cleanup | ✅ |
-| M3 | Ingress · intent routing · Policy Engine · Docker | ✅ |
-| M4 | Brain ReAct · three-ring tools · MCP client/server · cost control | ✅ |
-| M5 | Five-layer memory · SOUL · memory tools | ✅ |
-| M6 | Skill Generator · AST + sandbox | ✅ |
-| M7 | Evolution engine · governance · DPO collection · versioned rules | ✅ |
-| M8 | ToolUseContract hardening (A/B/C) | ✅ except M8.A real-trace validation |
-
-Details: [`docs/Pulse实施计划.md`](./docs/Pulse实施计划.md).
+| Deploy | single Python process · Docker Compose | No K8s required — runs out of the box |
 
 ---
 
@@ -456,51 +438,91 @@ Details: [`docs/Pulse实施计划.md`](./docs/Pulse实施计划.md).
 - Testing engineering: [`docs/engineering/testing-guide.md`](./docs/engineering/testing-guide.md)
 - ADRs: [`docs/adr/`](./docs/adr/)
 - Coding / testing constitution: [`docs/code-review-checklist.md`](./docs/code-review-checklist.md)
+- Internal implementation plan (contributors): [`docs/Pulse实施计划.md`](./docs/Pulse实施计划.md)
 
 ---
 
 ## Roadmap
 
-Job search is the first stop; the architecture already leaves room for much more.
+> Job search is the first stop, but the stage Pulse leaves room for is much bigger. Below are the pluggable skill-pack directions — each is an independent Module directory, each welcomes PRs.
 
-**Done**
+### Released · v0 baseline
 
 - [x] Generic Agent OS kernel (AgentRuntime + event bus + patrol lifecycle)
 - [x] ReAct + three-ring tools (Ring 1/2/3 + Meta SkillGen)
-- [x] Three-contract tool use (ADR-001 A/B/C)
+- [x] Three-contract tool use (ADR-001 A/B/C) against agent hallucination
 - [x] Layer × Scope five-layer memory + separate Observability plane
 - [x] SOUL tiers + Evolution Engine + Gated / Supervised / Autonomous governance
 - [x] MCP Server + Client (bidirectional)
 - [x] Job skill pack: BOSS JD scan / outreach / HR auto-reply / résumé send / email tracking
 
-**In progress / near term**
+### In progress · kernel hardening
 
-- [ ] Ship SafetyPlane — subscribe to EventBus for policy gates + manual takeover
-- [ ] More channels: WeCom long-lived bot, Discord, Telegram
-- [ ] Job intel: real interview sites (Nowcoder / Maimai), deeper company research module
+- [ ] **Ship SafetyPlane** — subscribe to EventBus for policy gates + manual takeover + risk sandbox
+- [ ] **More channels** — WeCom long-lived bot · Discord · Telegram (Feishu already shipped)
+- [ ] **Job intel v2** — real interview sites (Nowcoder / Maimai), deeper company research module
+- [ ] **Local offline mode** — Ollama + local Qwen so Pulse survives without the internet
 
-**New skill packs (architecture ready)**
+---
 
-- [ ] Calendar / alarm / weather / travel assistant (Ring 1 tools exist in `tools/`; productize compositions)
-- [ ] Smart-home MCP (Home Assistant / Matter)
-- [ ] Finance weekly report module (bank/broker APIs)
-- [ ] Travel guide module (multi-source crawl + LLM synthesis)
-- [ ] Game auto check-in / dailies module
-- [ ] Local offline mode (Ollama + local Qwen)
+### 🎮 Game automation skill pack
 
-**Longer term**
+Make Pulse the **digital workhorse that handles the daily grind for SLG / MMO / card games**. The Patchright + DOM scaffolding that cracked BOSS anti-scraping becomes a reusable toolkit for game scenarios.
 
-- [ ] Skill Generator generates full modules (today: Ring 1 tools only)
-- [ ] Wire DPO Track B into a real training pipeline (Track A preferences shipped)
-- [ ] Cross-device sync (light mobile channel + cloud Pulse primary)
+- [ ] **Generic game module skeleton** — multi-account management · cookie persistence · window matrix · captcha/slider strategies
+- [ ] **Dailies DSL** — describe "login → sign-in → mail → dungeons → gacha pity tracking → bag cleanup" in YAML per game
+- [ ] **Cross-server event alerts** — subscribe to official announcements + push "limited discounts", "first-charge bonuses", "new banner open" to Feishu/WeCom
+- [ ] **Strategic gacha log** — record per-card probability distribution + luck statistics so you can whale (or not) with data
+- [ ] **One subdirectory per game** — `modules/game/<game_name>/`, merge PR to go live. Adapters for *Genshin Impact*, *Arknights*, *Honkai: Star Rail*, *FGO*, *Blue Archive*, and more are waiting to be written
+
+### ✈️ End-to-end life assistant
+
+Not a "Q&A chatbot" — **a closed loop from one line of intent to a full plan**.
+
+- [ ] **End-to-end travel planning** — say "I want to visit Dali for the National Day holiday" and Pulse plans flights, hotels, weather watch, visa/doc reminders, must-see spots + hidden gems + food, calendar entries, and a 24-hour pre-departure sanity recheck
+- [ ] **Finance weekly** — bank / broker / Alipay APIs · LLM flags anomalies · weekend digest
+- [ ] **Health guardian** — sleep / HR data · structured physical reports · proactive nudges on anomalies
+- [ ] **Smart home orchestration** — Home Assistant / Matter MCP · conversational lights / HVAC / power usage
+- [ ] **Inbox copilot** — auto-classify interview invites / bills / subscriptions · calendar important events · mute noise
+- [ ] **Study companion** — subscribe to courses / papers / newsletters · daily key-point extraction · mistake-book-style proactive review
+
+### 🧑‍💻 Extend & self-extend
+
+- [ ] **Skill Generator v2** — evolve from "generate Ring 1 tool" to "**LLM generates a full module directory**" (patrol / memory / intent included) — the agent literally grows new skills
+- [ ] **10k+ MCP ecosystem plug-and-play** — GitHub / Notion / Slack / Linear / Sentry — anything Claude Desktop can talk to, Pulse can too
+- [ ] **Cross-device sync** — lightweight mobile channel + cloud Pulse primary, enabling real-time response on the go
+- [ ] **DPO Track B closed loop** — turn real dialogue into preference pairs automatically and feed a fine-tuning pipeline — the agent learns to sound like you
+
+### 🧬 Frontier explorations · toward a true JARVIS
+
+No timeline commitments here — directions Pulse is committed to keep researching:
+
+- [ ] **Emotional Intelligence** — beyond friendly tone: read your mood and adapt strategy (no harassing you during low periods, mute noisy sources during anxiety)
+- [ ] **Personality Evolution** — SOUL `[MUTABLE]` beliefs truly co-evolve with you over time while `[CORE]` beliefs hold the line
+- [ ] **Sleep-Time Consolidation** — inspired by Letta's Sleep-Time Compute: nightly consolidation of Recall → Archival → Core, the way humans sleep on memory
+- [ ] **Embodied Agent** — robot / desktop control (OpenAI Operator style) — upgrade the agent from "watches" to "acts"
+- [ ] **Agent Society** — multiple Pulse instances collaborate across users (job agent ↔ recruiter agent / travel agent ↔ hotel agent) via MCP + A2A
+- [ ] **Memory watermark & right-to-forget** — GDPR-style "user-level one-click forget", audit chain for memory rollback
+
+> Frontier directions are not vague aspirations. The SOUL evolution, five-layer memory, EventBus audit, and governance gate that underpin them **are already implemented in the current codebase** — the frontier work evolves on top of these foundations, not on a rewrite.
 
 ---
 
 ## Contributing
 
-Pulse is at **v0** — issues and PRs welcome; great time to jump in. Before a PR, read [`docs/code-review-checklist.md`](./docs/code-review-checklist.md) — coding + testing constitution (no swallowed exceptions, no silent fallbacks, no fake tests).
+Pulse is at **v0** — early contributors have the opportunity to shape the project's core architecture.
 
-For architecture changes, open an RFC-style issue first; ADR process: [`docs/adr/`](./docs/adr/).
+Contributors from different backgrounds can find a meaningful place:
+
+- 🎮 **Hardcore mobile gamers** — ship a `modules/game/<game_name>/` skill pack that automates sign-in / dailies / gacha. The Patchright anti-scrape scaffolding is already validated in the job domain and can be reused directly
+- ✈️ **Life-automation enthusiasts** — pick a domain (travel / health / home / finance) and close the loop from "one sentence of intent → full plan"
+- 🧑‍💻 **Architecture / kernel contributors** — Brain / Memory / AgentRuntime / SafetyPlane / MCP all have open problems worth depth, each backed by its own ADR
+- 🎨 **Prompt / LLM researchers** — SOUL evolution, preference learning Track A, DPO collection Track B, and the three-contract Commitment Verifier are frontier problems in LLM engineering
+- 📚 **Docs / evangelists** — bilingual README, ADR translations, tutorial videos, example projects — any form of contribution is welcome
+
+Before opening a PR, please read [`docs/code-review-checklist.md`](./docs/code-review-checklist.md) — Pulse's **coding and testing principles** (no swallowed exceptions, no silent fallbacks, no fabricated tests). Quality bars are high — suited to contributors who value code quality.
+
+For architecture changes, open an RFC-style issue first; see the ADR process under [`docs/adr/`](./docs/adr/).
 
 ---
 
@@ -524,7 +546,7 @@ Ideas borrowed or inspired by:
 ---
 
 <p align="center">
-  <strong>If Pulse helps you, a Star means a lot to open-source authors ⭐</strong>
+  <strong>If Pulse resonates with you, a Star ⭐ is the most tangible support for the project</strong>
   <br/>
   <sub>Built for people who want an AI that stays, not one that forgets every conversation.</sub>
 </p>
