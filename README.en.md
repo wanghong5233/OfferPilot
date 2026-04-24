@@ -87,7 +87,7 @@ Pulse aims to **decouple the agent from the chat window and turn it into an assi
 | **Skill Generator** | Natural language → code → AST allowlist → sandbox → hot load | ✅ |
 | **Self-evolution engine** | SOUL `[CORE]` / `[MUTABLE]` tiers · Autonomous / Supervised / Gated governance · preference learning Track A · DPO collection Track B | ✅ |
 | **Browser automation** | Patchright (Playwright fork, CDP anti-fingerprinting), validated on BOSS Zhipin | ✅ |
-| **Multi-channel ingress** | HTTP / SSE / CLI / Feishu · intent routing exact → prefix → LLM | ✅ |
+| **Multi-channel ingress** | HTTP / SSE / CLI / WeCom / Feishu · intent routing exact → prefix → LLM | ✅ |
 | **HITL governance** | Policy Engine L0–L5 gates · approval / rollback / versioned rules + diff | ✅ |
 
 ---
@@ -102,7 +102,7 @@ Pulse aims to **decouple the agent from the chat window and turn it into an assi
 │                               + 1 background daemon thread)               │
 │                                                                            │
 │  ┌──────────────────────── Ingress ────────────────────────┐              │
-│  │  HTTP API │ SSE stream │ CLI │ Feishu adapter │ MCP     │              │
+│  │  HTTP API │ SSE │ CLI │ WeCom/Feishu adapter │ MCP      │              │
 │  └───────────────────────────┬─────────────────────────────┘              │
 │                              │                                             │
 │                              ▼                                             │
@@ -259,13 +259,13 @@ Pulse’s current skill packs focus on job search, but the kernel is already gen
 
 | Sub-capability | What it does |
 |---|---|
-| **interview** | Interview intel harvest → LLM extract signals → aggregate by company → Feishu digest |
+| **interview** | Interview intel harvest → LLM extract signals → aggregate by company → IM digest (WeCom / Feishu) |
 | **techradar** | Tech radar (RSS / GitHub Trending / WeChat) → LLM relevance → summary → digest |
 | **query** | Semantic intel search + category filters |
 
 ### Email domain `modules/email/tracker/`
 
-Read-only IMAP → LLM email classify (invite / rejection / more materials) → structured calendar extraction → state sync + Feishu alerts.
+Read-only IMAP → LLM email classify (invite / rejection / more materials) → structured calendar extraction → state sync + IM alerts (WeCom / Feishu).
 
 ### System domain `modules/system/`
 
@@ -363,7 +363,7 @@ Pulse/
 │   │   ├── policy.py            Policy Engine (L0–L5 gates)
 │   │   ├── cost.py              daily LLM budget + auto degrade
 │   │   ├── router.py            intent routing (exact/prefix/LLM)
-│   │   ├── channel/             multi-channel (HTTP/CLI/Feishu)
+│   │   ├── channel/             multi-channel (HTTP/CLI/WeCom/Feishu)
 │   │   ├── browser/             Patchright pool
 │   │   ├── llm/                 multi-model routing + failover
 │   │   ├── skill_generator.py   NL → hot-loaded tools
@@ -462,7 +462,7 @@ Pulse/
 ### In progress · kernel hardening
 
 - [ ] **Ship SafetyPlane** — subscribe to EventBus for policy gates + manual takeover + risk sandbox
-- [ ] **More channels** — WeCom long-lived bot · Discord · Telegram (Feishu already shipped)
+- [ ] **More channels** — Discord · Telegram · WeCom WebSocket long-lived bot (HTTPS webhook WeCom / Feishu already shipped)
 - [ ] **Job intel v2** — real interview sites (Nowcoder / Maimai), deeper company research module
 - [ ] **Local offline mode** — Ollama + local Qwen so Pulse survives without the internet
 
@@ -474,7 +474,7 @@ Make Pulse the **digital workhorse that handles the daily grind for SLG / MMO / 
 
 - [ ] **Generic game module skeleton** — multi-account management · cookie persistence · window matrix · captcha/slider strategies
 - [ ] **Dailies DSL** — describe "login → sign-in → mail → dungeons → gacha pity tracking → bag cleanup" in YAML per game
-- [ ] **Cross-server event alerts** — subscribe to official announcements + push "limited discounts", "first-charge bonuses", "new banner open" to Feishu/WeCom
+- [ ] **Cross-server event alerts** — subscribe to official announcements + push "limited discounts", "first-charge bonuses", "new banner open" to WeCom / Feishu
 - [ ] **Strategic gacha log** — record per-card probability distribution + luck statistics so you can whale (or not) with data
 - [ ] **One subdirectory per game** — `modules/game/<game_name>/`, merge PR to go live. Adapters for *Genshin Impact*, *Arknights*, *Honkai: Star Rail*, *FGO*, *Blue Archive*, and more are waiting to be written
 

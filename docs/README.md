@@ -86,12 +86,17 @@ docs/
 | [ADR-003](./adr/ADR-003-ActionReport.md) | ActionReport — 长任务结构化执行报告 | Accepted |
 | [ADR-004](./adr/ADR-004-AutoReplyContract.md) | BOSS 自动回复契约 + Patrol 控制面 | Proposed(§6.1 已落地) |
 | [ADR-005](./adr/ADR-005-Observability.md) | 统一可观测性（trace_id / 日志结构） | Accepted |
+| [ADR-006](./adr/ADR-006-SafetyPlane.md) | SafetyPlane — 授权边界与升级原语 | Proposed |
+
+**写 ADR 前先读 [engineering/adr-guide.md](./engineering/adr-guide.md)**（Pulse-A 轻量 / Pulse-B 重量 两档模板、状态流转、反模式）。
 
 ## E. 工程化实践（`engineering/`）
 
 | 文档 | 内容 |
 |---|---|
 | [testing-guide.md](./engineering/testing-guide.md) | 合同测试四形态 + LLM 应用特有测试点 + 反模式 |
+| [adr-guide.md](./engineering/adr-guide.md) | ADR 写作规范：业界三档对比、Pulse 两档模板、生命周期、反模式 |
+| [agent-concepts.md](./engineering/agent-concepts.md) | Agent 工程概念笔记：Harness / Autonomy Spectrum / HITL·Escalate·Interrupt·Elicitation 辨析 / 五方案对比 / 架构总览 / 术语速查 |
 
 ## F. 业务模块设计（`modules/`）
 
