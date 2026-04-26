@@ -46,7 +46,6 @@ To do that, Pulse cleanly separates a generic **agent kernel** from **domain ski
 - **Kernel** (`core/`) is domain-agnostic — long-horizon scheduling, five-layer memory, contract-based tool use, event auditing, and personality evolution in one place.
 - **Skill packs** (`modules/`) are grouped by domain; new scenarios add directories without changing the framework.
 - **Shipped skill packs**: job search (BOSS Zhipin JD scan / proactive outreach / HR auto-reply / résumé delivery), intel digest (multi-topic YAML packs driving a six-stage pipeline + cross-topic search), and email tracking (IMAP classification + schedule extraction).
-- **The real technical depth** sits in three places — three-contract tool use (against agent hallucination), Layer × Scope five-layer memory, and the long-running `AgentRuntime` kernel (patrol + circuit breaking + event bus).
 
 This is only the beginning. **Every life workflow worth automating becomes Pulse's next destination** — automating daily game check-ins, generating end-to-end travel plans, weekly finance reports, orchestrating smart-home devices, even synthesizing new skills and accumulating habits and preferences uniquely yours. One kernel, an unbounded set of skill packs.
 
