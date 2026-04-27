@@ -22,4 +22,5 @@ def test_health_lists_phase1_modules() -> None:
         "job_chat",
         "email_tracker",
         "intel",
+        "game",
     }.issubset(modules)

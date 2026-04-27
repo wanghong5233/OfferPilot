@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
 
 from pulse.core.llm.router import LLMRouter
@@ -40,6 +41,18 @@ class _FakeClient:
         return _StructuredInvoker()
 
 
+class _VisionClient:
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.invoke_args: list[Any] = []
+
+    def invoke(self, value: Any) -> Any:
+        self.invoke_args.append(value)
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
 def _fake_factory(responses: dict[str, Any]):
     def _factory(model: str, base_url: str, api_key: str) -> _FakeClient:
         assert base_url
@@ -71,7 +84,15 @@ def test_candidate_models_route_env_overrides_and_dedupes(monkeypatch) -> None:
             "classification": ("c1", "c2"),
         }
     )
-    assert router.candidate_models("classification") == ["r1", "g2", "g1", "d1", "d2"]
+    assert router.candidate_models("classification") == [
+        "r1",
+        "g2",
+        "c1",
+        "c2",
+        "g1",
+        "d1",
+        "d2",
+    ]
 
 
 def test_resolve_api_config_prefers_pulse_env(monkeypatch) -> None:
@@ -119,3 +140,58 @@ def test_invoke_structured_fallback_and_schema_parse(monkeypatch) -> None:
     )
     output = router.invoke_structured("hello", _StructuredOutput)
     assert output.value == "ok-structured"
+
+
+def test_vision_route_default_models_are_available() -> None:
+    router = LLMRouter()
+    assert router.route_default_pair("vision") == ("gpt-4o-mini", "qwen-vl-max")
+
+
+def test_invoke_vision_json_sends_multimodal_message_and_parses_json(monkeypatch) -> None:
+    monkeypatch.setenv("PULSE_MODEL_API_KEY", "sk-test")
+    client = _VisionClient(AIMessage(content='{"action_id": "tap_claim", "confidence": 0.8}'))
+    router = LLMRouter(
+        route_defaults={"default": ("d1", "d2"), "vision": ("vision-model", "d2")},
+        client_factory=lambda model, base_url, api_key: client,  # noqa: ARG005
+    )
+
+    output = router.invoke_vision_json("choose action", [b"img1", b"img2"])
+
+    assert output == {"action_id": "tap_claim", "confidence": 0.8}
+    assert len(client.invoke_args) == 1
+    messages = client.invoke_args[0]
+    assert isinstance(messages, list)
+    assert isinstance(messages[0], HumanMessage)
+    content = messages[0].content
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "choose action"}
+    image_blocks = content[1:]
+    assert len(image_blocks) == 2
+    assert all(block["type"] == "image_url" for block in image_blocks)
+    assert all(
+        str(block["image_url"]["url"]).startswith("data:image/png;base64,")
+        for block in image_blocks
+    )
+
+
+def test_invoke_vision_json_rejects_empty_images(monkeypatch) -> None:
+    monkeypatch.setenv("PULSE_MODEL_API_KEY", "sk-test")
+    client = _VisionClient(AIMessage(content='{"ok": true}'))
+    router = LLMRouter(
+        route_defaults={"default": ("d1", "d2"), "vision": ("vision-model", "d2")},
+        client_factory=lambda model, base_url, api_key: client,  # noqa: ARG005
+    )
+
+    assert router.invoke_vision_json("choose action", [], default={"fallback": True}) == {"fallback": True}
+    assert client.invoke_args == []
+
+
+def test_invoke_vision_json_returns_default_on_non_json(monkeypatch) -> None:
+    monkeypatch.setenv("PULSE_MODEL_API_KEY", "sk-test")
+    client = _VisionClient(AIMessage(content="not json"))
+    router = LLMRouter(
+        route_defaults={"default": ("d1", "d2"), "vision": ("vision-model", "d2")},
+        client_factory=lambda model, base_url, api_key: client,  # noqa: ARG005
+    )
+
+    assert router.invoke_vision_json("choose action", [b"img"], default=None) is None

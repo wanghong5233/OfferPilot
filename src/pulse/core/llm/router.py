@@ -15,7 +15,7 @@
     * ``invoke_chat(messages, tools, route)`` — ReAct / Tool-use 专用
 
 ``route`` 约束见 ``DEFAULT_ROUTE_MODELS``; 常用取值:
-``classification`` / ``planning`` / ``generation`` / ``cheap``。
+``classification`` / ``planning`` / ``generation`` / ``vision`` / ``cheap``。
 
 *不要*在业务侧直接构造 ``ChatOpenAI`` 或读 ``OPENAI_API_KEY``, 所有凭证解析
 都在 ``LLMRouter.resolve_api_config`` 里统一处理。
@@ -23,13 +23,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import ChatOpenAI
 
 from ..event_types import EventTypes, make_payload
@@ -77,6 +78,7 @@ DEFAULT_ROUTE_MODELS: RouteDefaults = {
     "planning":       ("gpt-4.1",      "qwen3-max"),
     "generation":     ("gpt-4o-mini",  "qwen-plus"),
     "classification": ("gpt-4o-mini",  "qwen-turbo"),
+    "vision":         ("gpt-4o-mini",  "qwen-vl-max"),
     "cheap":          ("gpt-4o-mini",  "qwen-turbo"),
 }
 
@@ -556,3 +558,100 @@ class LLMRouter:
                 cleaned[:160],
             )
             return default
+
+    def invoke_vision_json(
+        self,
+        prompt_value: Any,
+        images: list[bytes],
+        *,
+        route: str = "vision",
+        default: Any = None,
+        image_mime: str = "image/png",
+    ) -> Any:
+        """Invoke a multimodal route and parse its text response as JSON.
+
+        This mirrors :meth:`invoke_json`: transport or parsing failures return
+        ``default``. Image bytes are sent to the provider but never copied into
+        logs or event payloads.
+        """
+        if not images:
+            logger.warning("LLMRouter.invoke_vision_json: no images supplied")
+            return default
+
+        safe_mime = str(image_mime or "image/png").strip() or "image/png"
+        content: list[dict[str, Any]] = [{"type": "text", "text": str(prompt_value or "")}]
+        for image in images:
+            if not isinstance(image, (bytes, bytearray)) or not image:
+                logger.warning("LLMRouter.invoke_vision_json: invalid image payload")
+                return default
+            encoded = base64.b64encode(bytes(image)).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{safe_mime};base64,{encoded}"},
+                }
+            )
+
+        candidates = self.candidate_models(route)
+        logger.debug(
+            "llm_invoke_start kind=vision_json route=%s candidates=%s images=%d",
+            route,
+            candidates,
+            len(images),
+        )
+        errors: list[str] = []
+        for model in candidates:
+            try:
+                message = self.build_client(model).invoke([HumanMessage(content=content)])
+            except (RuntimeError, ValueError, TypeError, OSError) as exc:  # pragma: no cover - provider/network dependent
+                msg = str(exc)[:400]
+                errors.append(f"{model}: {msg}")
+                logger.warning(
+                    "llm_attempt_failed kind=vision_json route=%s model=%s err=%s",
+                    route,
+                    model,
+                    msg,
+                )
+                continue
+
+            raw = self.coerce_text(message.content if isinstance(message, AIMessage) else message)
+            cleaned = self.strip_code_fence(raw)
+            try:
+                parsed = json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.info(
+                    "LLMRouter.invoke_vision_json: non-JSON response (route=%s, err=%s, head=%r)",
+                    route,
+                    exc,
+                    cleaned[:160],
+                )
+                return default
+
+            logger.info(
+                "llm_invoke_ok kind=vision_json route=%s model=%s images=%d",
+                route,
+                model,
+                len(images),
+            )
+            self._emit(
+                EventTypes.LLM_INVOKE_OK,
+                kind="vision_json",
+                route=route,
+                model=model,
+                image_count=len(images),
+                prompt_preview=self._make_preview(str(prompt_value or "")),
+                content_preview=self._structured_preview(parsed),
+            )
+            return parsed
+
+        logger.error("llm_invoke_exhausted kind=vision_json route=%s tried=%s", route, candidates)
+        self._emit(
+            EventTypes.LLM_INVOKE_EXHAUSTED,
+            kind="vision_json",
+            route=route,
+            tried=list(candidates),
+            errors=errors,
+            image_count=len(images),
+            prompt_preview=self._make_preview(str(prompt_value or "")),
+        )
+        return default

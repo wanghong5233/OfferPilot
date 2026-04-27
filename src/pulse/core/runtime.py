@@ -280,7 +280,7 @@ class AgentRuntime:
             interval_seconds=peak_interval,
             handler=_wrapped_handler,
             enabled=enabled,
-            run_immediately=False,
+            run_immediately=True,
             peak_interval_seconds=peak_interval,
             offpeak_interval_seconds=offpeak_interval,
             active_hours_only=active_hours_only,
@@ -749,6 +749,8 @@ class AgentRuntime:
             "peak_interval_seconds": task.peak_interval_seconds,
             "offpeak_interval_seconds": task.offpeak_interval_seconds,
             "active_hours_only": bool(task.active_hours_only),
+            "weekday_windows": task.weekday_windows,
+            "weekend_windows": task.weekend_windows,
             "stats": dict(stats),
         }
 
@@ -891,7 +893,9 @@ class AgentRuntime:
 
         elapsed_ms = ctx.elapsed_ms()
 
-        # Stage 5: 触发到期 patrol —— 必须尊重 ScheduleTask.enabled。
+        # Stage 5: 触发到期 patrol —— 必须尊重 ScheduleTask.enabled 与
+        # SchedulerEngine.is_due。heartbeat 是全局自检, 不能绕过每个 patrol
+        # 自己声明的 interval / weekday_windows / weekend_windows。
         # ADR-004 §6.1.1 规定启停是 IM 独占的单一认知路径
         # (system.patrol.enable/disable → engine.set_enabled)。
         # 以前这里直接遍历 _patrol_handlers, 绕过 enabled 检查, 把
@@ -908,11 +912,14 @@ class AgentRuntime:
                 task = engine.get_task(name)
                 if task is None or not task.enabled:
                     continue
+                if not engine.is_due(task, now=now):
+                    continue
                 stats = self._patrol_stats.get(name, {})
                 if stats.get("circuit_open"):
                     continue
                 handler, ws_id, budget = entry
                 self._execute_patrol(name, handler, workspace_id=ws_id, token_budget=budget)
+                engine.mark_ran(name, when=now)
                 triggered_patrols.append(name)
 
         result = {

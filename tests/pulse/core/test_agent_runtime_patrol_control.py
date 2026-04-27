@@ -286,6 +286,55 @@ def test_heartbeat_skips_disabled_patrol_and_runs_enabled_one(runtime, monkeypat
     )
 
 
+def test_heartbeat_respects_patrol_interval_after_first_due_run(runtime, monkeypatch) -> None:
+    """A newly enabled patrol may run on the first tick, then must obey its
+    own interval. Heartbeat must not turn every enabled patrol into a
+    tick_seconds-frequency task.
+    """
+    rt, _ = runtime
+    monkeypatch.setattr(rt._config, "is_active", lambda _now: True)
+    calls = _register_noop_patrol(
+        rt,
+        "daily_game.patrol",
+        enabled=True,
+    )
+
+    first = rt.heartbeat()
+    second = rt.heartbeat()
+
+    assert first["triggered_patrols"] == ["daily_game.patrol"]
+    assert second["triggered_patrols"] == []
+    assert len(calls) == 1
+
+
+def test_heartbeat_respects_patrol_task_windows(runtime, monkeypatch) -> None:
+    """Per-task windows are part of the patrol contract. A globally active
+    heartbeat must not run a task whose own window is inactive.
+    """
+    rt, _ = runtime
+    monkeypatch.setattr(rt._config, "is_active", lambda _now: True)
+    calls: list[str] = []
+
+    def _handler(ctx):
+        calls.append(ctx.task_id)
+
+    rt.register_patrol(
+        name="windowed_game.patrol",
+        handler=_handler,
+        peak_interval=60,
+        offpeak_interval=60,
+        enabled=True,
+        active_hours_only=True,
+        weekday_windows=((25, 26),),
+        weekend_windows=((25, 26),),
+    )
+
+    result = rt.heartbeat()
+
+    assert result["triggered_patrols"] == []
+    assert calls == []
+
+
 def test_manual_wake_skips_disabled_patrol_and_runs_enabled_one(runtime, monkeypatch) -> None:
     """manual_wake shares the same contract as heartbeat: it is a
     convenience "force tick NOW" surface, not an authorization channel.

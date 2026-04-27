@@ -12,13 +12,17 @@
     "intel.digest.list": "intel",
     "intel.digest.latest": "intel",
     "intel.digest.run": "intel",
-    "intel.search": "intel"
+    "intel.search": "intel",
+    "game.workflow.run": "game",
+    "game.runs.list": "game",
+    "game.runs.latest": "game"
   },
   "exact": [
     { "key": "ping", "intent": "general.default" },
     { "key": "/ping", "intent": "general.default" },
     { "key": "/intel digest", "intent": "intel.digest.list" },
-    { "key": "/intel list", "intent": "intel.digest.list" }
+    { "key": "/intel list", "intent": "intel.digest.list" },
+    { "key": "/game runs", "intent": "game.runs.list" }
   ],
   "prefix": [
     { "prefix": "/email process", "intent": "email.process" },
@@ -26,6 +30,8 @@
     { "prefix": "/intel digest list", "intent": "intel.digest.list" },
     { "prefix": "/intel digest latest", "intent": "intel.digest.latest" },
     { "prefix": "/intel digest run", "intent": "intel.digest.run" },
-    { "prefix": "/intel search", "intent": "intel.search" }
+    { "prefix": "/intel search", "intent": "intel.search" },
+    { "prefix": "/game run", "intent": "game.workflow.run" },
+    { "prefix": "/game latest", "intent": "game.runs.latest" }
   ]
 }

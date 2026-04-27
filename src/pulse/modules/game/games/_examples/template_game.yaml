@@ -1,0 +1,26 @@
+id: template_game
+name: 示例游戏
+package_candidates:
+  - com.example.game
+driver: adb_airtest
+schedule:
+  enabled_by_default: false
+  peak_interval_seconds: 86400
+  offpeak_interval_seconds: 86400
+  active_hours_only: true
+  weekday_windows: [[9, 24]]
+  weekend_windows: [[9, 24]]
+templates_dir: template_game
+tasks:
+  - name: sign_in
+    type: tap_template
+    template: sign_in_button.png
+risk_control:
+  templates: []
+safety:
+  default_dry_run: true
+  jitter_ms: [200, 800]
+  max_total_seconds: 300
+publish:
+  notifier_channels: [console]
+  promote_archival_on: [ssr, limited, special_event]

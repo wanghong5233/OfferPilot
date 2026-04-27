@@ -5,6 +5,7 @@
 * :func:`reply_policy` —— 代表用户回 HR 文字消息
 * :func:`send_resume_policy` —— 发简历附件给 HR
 * :func:`card_policy` —— 点击面试 / 换简历卡片 (不可逆)
+* :func:`gacha_policy` —— 游戏免费 / 半价抽卡预算闸门
 
 **为什么 policy 是 Python 函数, 不是 YAML 规则?**
 
@@ -58,6 +59,7 @@ __all__ = (
     "reply_policy",
     "send_resume_policy",
     "card_policy",
+    "gacha_policy",
 )
 
 
@@ -287,3 +289,96 @@ def card_policy(intent: Intent, ctx: PermissionContext) -> Decision:
         reason="job_chat.card.requires_user_confirmation",
         rule_id="job_chat.card.ask_default",
     )
+
+
+def gacha_policy(intent: Intent, ctx: PermissionContext) -> Decision:
+    """游戏抽卡动作的通用授权策略.
+
+    Intent.args 约定字段:
+
+    * ``game_id``: 游戏 id
+    * ``task_name``: task 名
+    * ``mode``: ``free`` 或 ``half_price``
+    * ``daily_max_pulls``: 半价抽卡每日最多点击次数
+    * ``used_today``: 当日已经成功点击次数
+
+    免费抽卡不消耗资源,直接 allow。半价抽卡在预算内 allow,超过预算 ask。
+    PVP / 部队 / 战斗类动作不走本 policy,由 Game workflow 第一版直接禁用。
+    """
+    args = intent.args
+    mode = str(args.get("mode") or "").strip()
+    game_id = str(args.get("game_id") or "").strip() or "unknown_game"
+    task_name = str(args.get("task_name") or "").strip() or "gacha"
+
+    if mode == "free":
+        return Decision.allow(
+            reason="game.gacha.free_pull_allowed",
+            rule_id="game.gacha.free_allow",
+        )
+
+    if mode != "half_price":
+        return Decision.deny(
+            reason="game.gacha.unsupported_mode",
+            deny_code="unsupported_gacha_mode",
+            rule_id="game.gacha.mode_deny",
+        )
+
+    daily_max = _safe_int(args.get("daily_max_pulls"), default=0)
+    used_today = _safe_int(args.get("used_today"), default=0)
+    if daily_max <= 0:
+        return Decision.ask(
+            reason="game.gacha.missing_budget",
+            rule_id="game.gacha.budget_ask",
+            ask_request=AskRequest(
+                question=(
+                    f"{game_id} 的 {task_name} 是半价抽卡,但没有有效 daily_max_pulls。"
+                    "是否仍然执行? 回 'y' 确认, 回 'n' 拒绝。"
+                ),
+                resume_handle=ResumeHandle(
+                    task_id=f"game:{game_id}:{task_name}",
+                    module=ctx.module,
+                    intent=DEFAULT_RESUME_INTENT,
+                    payload_schema=DEFAULT_RESUME_PAYLOAD_SCHEMA,
+                ),
+                timeout_seconds=DEFAULT_ASK_TIMEOUT_SECONDS,
+                context={"game_id": game_id, "task_name": task_name, "mode": mode},
+            ),
+        )
+
+    if used_today < daily_max:
+        return Decision.allow(
+            reason="game.gacha.within_daily_budget",
+            rule_id="game.gacha.half_price_allow",
+        )
+
+    return Decision.ask(
+        reason="game.gacha.daily_budget_exceeded",
+        rule_id="game.gacha.budget_exceeded_ask",
+        ask_request=AskRequest(
+            question=(
+                f"{game_id} 的 {task_name} 今日半价抽卡已达到预算 "
+                f"{used_today}/{daily_max}。是否额外执行一次? 回 'y' 确认, 回 'n' 拒绝。"
+            ),
+            resume_handle=ResumeHandle(
+                task_id=f"game:{game_id}:{task_name}",
+                module=ctx.module,
+                intent=DEFAULT_RESUME_INTENT,
+                payload_schema=DEFAULT_RESUME_PAYLOAD_SCHEMA,
+            ),
+            timeout_seconds=DEFAULT_ASK_TIMEOUT_SECONDS,
+            context={
+                "game_id": game_id,
+                "task_name": task_name,
+                "mode": mode,
+                "daily_max_pulls": daily_max,
+                "used_today": used_today,
+            },
+        ),
+    )
+
+
+def _safe_int(value: Any, *, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
