@@ -25,6 +25,7 @@ from .memory.envelope import MemoryLayer
 from .memory_reader import MemoryReaderAdapter
 from .prompt_contract import PromptContractBuilder
 from .task_context import ExecutionMode, StopReason, TaskContext
+from .tokenizer import count_tokens
 from .tool import ToolRegistry
 from .verifier import (
     CommitmentVerifier,
@@ -150,9 +151,16 @@ class Brain:
                     archival_memory=archival_memory,
                     workspace_memory=workspace_memory,
                 )
-                prompt_builder = PromptContractBuilder(memory=_auto_reader)
+                prompt_builder = PromptContractBuilder(
+                    memory=_auto_reader,
+                    max_input_tokens=self._router_input_budget("planning"),
+                    tokenizer_model=self._router_primary_model("planning"),
+                )
             else:
-                prompt_builder = PromptContractBuilder()
+                prompt_builder = PromptContractBuilder(
+                    max_input_tokens=self._router_input_budget("planning"),
+                    tokenizer_model=self._router_primary_model("planning"),
+                )
         self._prompt_builder = prompt_builder
         self._hooks = hooks or HookRegistry()
         self._compaction = compaction or CompactionEngine()
@@ -185,6 +193,18 @@ class Brain:
     # ------------------------------------------------------------------
     # Public entry
     # ------------------------------------------------------------------
+
+    def _router_primary_model(self, route: str) -> str:
+        resolver = getattr(self._llm_router, "primary_model", None)
+        if callable(resolver):
+            return str(resolver(route))
+        return PromptContractBuilder.DEFAULT_TOKENIZER_MODEL
+
+    def _router_input_budget(self, route: str) -> int:
+        resolver = getattr(self._llm_router, "input_token_budget", None)
+        if callable(resolver):
+            return int(resolver(route))
+        return PromptContractBuilder.DEFAULT_MAX_INPUT_TOKENS
 
     async def run(
         self,
@@ -542,7 +562,10 @@ class Brain:
 
                 if ctx.over_budget or not self._reserve_cost(route=f"tool:{original}", query=query, tool_args=args, ctx=ctx):
                     obs: Any = {"error": "Budget exceeded for this tool call"}
-                    messages.append(ToolMessage(content=_serialize(obs), tool_call_id=tc_id))
+                    messages.append(ToolMessage(
+                        content=self._render_observation(tool_name=original, observation=obs),
+                        tool_call_id=tc_id,
+                    ))
                     steps.append(BrainStep(
                         index=idx, thought="budget check failed", action="use_tool",
                         tool_name=original, tool_args=args, observation=obs,
@@ -557,7 +580,10 @@ class Brain:
                 )
                 if tool_hook.block:
                     obs = {"error": f"Tool blocked by hook: {tool_hook.reason}"}
-                    messages.append(ToolMessage(content=_serialize(obs), tool_call_id=tc_id))
+                    messages.append(ToolMessage(
+                        content=self._render_observation(tool_name=original, observation=obs),
+                        tool_call_id=tc_id,
+                    ))
                     steps.append(BrainStep(
                         index=idx, thought=f"hook blocked {original}", action="use_tool",
                         tool_name=original, tool_args=args, observation=obs,
@@ -583,7 +609,10 @@ class Brain:
                      "status": status, "latency_ms": latency},
                 )
 
-                messages.append(ToolMessage(content=_serialize(obs), tool_call_id=tc_id))
+                messages.append(ToolMessage(
+                    content=self._render_observation(tool_name=original, observation=obs),
+                    tool_call_id=tc_id,
+                ))
 
                 # ADR-003 Step B.1b: if the handler emitted a structured
                 # ActionReport, inject it as a SystemMessage immediately
@@ -661,13 +690,34 @@ class Brain:
     # ------------------------------------------------------------------
 
     def _build_system_prompt(self, *, ctx: TaskContext, query: str) -> str:
-        """通过 PromptContractBuilder 组装 system prompt。"""
+        """通过 PromptContractBuilder 组装 system prompt。
+
+        Budget 治理由 builder 内部完成:
+          * 真实 tokenizer (tiktoken / heuristic) 按段计数;
+          * 总量超 ``max_input_tokens`` 时按 priority **整段丢弃**
+            (archival / recall → recent → 不动 P0/P1), 永远不在字符串
+            中间切;
+          * 即使丢完所有 P2/P3 仍超过预算 → ``RuntimeError`` 指明哪个
+            P0/P1 段过大, 由调用方 (Brain runner) 暴露给上层. 静默截断
+            会让模型瞎眼又没有上游告警 — 违反 §1.1 暴露优于兜底.
+
+        Token-budget for ReAct 循环防失控:
+          * **不**把 ``contract.token_estimate`` 计入 ``ctx.consume_tokens``.
+          * prompt 组装是 Brain 的固定开销 (identity + memory + tools),
+            跟用户当轮 query 无关, 也不是 ReAct 可控变量. 算进 task
+            ``token_budget`` 会让"记忆越多 → 用户越快被拒"和长程助手
+            语义冲突. 真实发送成本走 ``CostController`` 按 USD 结算.
+        """
         contract = self._prompt_builder.build(ctx, query)
-        prompt = contract.text
-        ctx.consume_tokens(contract.token_estimate)
-        if len(prompt) > 6000:
-            prompt = prompt[:6000] + "\n...(context truncated)"
-        return prompt
+        if contract.dropped_sections:
+            logger.warning(
+                "brain_prompt_budget dropped=%s tokens=%d session=%s task=%s",
+                list(contract.dropped_sections),
+                contract.token_estimate,
+                getattr(ctx, "session_id", None),
+                getattr(ctx, "task_id", None),
+            )
+        return contract.text
 
     # ------------------------------------------------------------------
     # Tool definitions for LLM
@@ -712,6 +762,13 @@ class Brain:
             ## Job Preferences (...)
             ...
         空结果直接返回空串 (调用方会跳过插入)。
+
+        注意: ``_render_domain_snapshots`` 返回 ``list[PromptSection]`` (typed
+        prompt fragment with drop-priority metadata), 不是 ``list[str]``。
+        这里必须显式取 ``section.text`` 再拼, 直接 ``"\\n\\n".join(sections)``
+        会抛 ``TypeError: sequence item 0: expected str instance, PromptSection
+        found`` —— mutating 工具(如 system.patrol.enable / job.profile.update)
+        成功后立刻触发, 所以这条路径过去对任何 mutates=True 的工具都是必炸。
         """
         try:
             sections = self._prompt_builder._render_domain_snapshots(ctx)
@@ -720,7 +777,10 @@ class Brain:
             return ""
         if not sections:
             return ""
-        body = "\n\n".join(sections)
+        texts = [section.text for section in sections if section.text and section.text.strip()]
+        if not texts:
+            return ""
+        body = "\n\n".join(texts)
         return "[Memory updated after tool call — use the following as the new baseline]\n\n" + body
 
     def _build_evolution_metadata(
@@ -905,7 +965,11 @@ class Brain:
 
     def _reserve_cost(self, *, route: str, query: str, tool_args: dict[str, Any], ctx: TaskContext | None = None) -> bool:
         text = json.dumps(tool_args, ensure_ascii=False)
-        tokens = self._cost_controller.estimate_tokens(query, text) if self._cost_controller is not None else max(1, len(query) // 4 + len(text) // 4)
+        tokens = (
+            self._cost_controller.estimate_tokens(query, text)
+            if self._cost_controller is not None
+            else max(1, count_tokens(f"{query}\n{text}"))
+        )
         if ctx is not None:
             ctx.consume_tokens(tokens)
             if ctx.over_budget:
@@ -993,6 +1057,13 @@ class Brain:
             )
             return raw_answer
 
+        # 不在这里硬截 query / raw_answer.
+        # shaper 走 ``route="generation"`` (gpt-4o-mini, 128k context),
+        # 历史上的字符硬砍是 LLM 写代码偷懒的痕迹 ——
+        # 用户多句话的复杂指令一旦超过 400 字 (用户实际场景: 海投+地点+薪资+
+        # 已投不重复, 250-600 字), shaper 看到的是被切掉一半的请求, 改写
+        # 出来的"客气话"会偏题. 长 raw_answer (列 5 个 JD) 同样被砍只留一半.
+        # 真正的成本治理走 CostController.daily_budget_usd, 不靠 brain 切字符串.
         shape_prompt = [
             SystemMessage(content=(
                 "你是一个回复润色器, 职责是把 agent 的原始输出改写成发给真实用户的一句话 IM 消息.\n"
@@ -1004,9 +1075,9 @@ class Brain:
                 "5. 输出**只**包含最终消息正文, 不要加前言/后记/引号.\n"
             )),
             HumanMessage(content=(
-                f"[用户的原始请求]\n{query.strip()[:400]}\n\n"
+                f"[用户的原始请求]\n{query.strip()}\n\n"
                 f"[Agent 这一轮实际调用的工具]\n{', '.join(used_tools) if used_tools else '(无)'}\n\n"
-                f"[Agent 的原始输出, 需要你改写]\n{raw_answer.strip()[:1200]}\n\n"
+                f"[Agent 的原始输出, 需要你改写]\n{raw_answer.strip()}\n\n"
                 "请输出改写后的用户消息:"
             )),
         ]
@@ -1304,6 +1375,15 @@ class Brain:
         return _default_extract_facts(observation)
 
     def _apply_soul_style(self, answer: str) -> str:
+        """Apply assistant prefix from soul block; **no length cap here**.
+
+        Channel-layer adapters (WeChat-Work / Feishu / web) are responsible
+        for any platform-specific message-size splitting (they each have
+        different limits — 4 KB for QYWX text, 30 KB for Feishu post, etc.).
+        Brain has no business chopping a long-form answer mid-string and
+        feeding the user "...(truncated)" — that destroyed answers carrying
+        e.g. multi-JD summaries (audit: 2026-04 trace_e2c5f1b9).
+        """
         text = str(answer or "").strip()
         if not text:
             return text
@@ -1317,8 +1397,6 @@ class Brain:
                 prefix = str(soul.get("assistant_prefix") or "").strip()
                 if prefix and not text.startswith(prefix):
                     text = f"{prefix}: {text}"
-        if len(text) > 2000:
-            return text[:2000] + "...(truncated)"
         return text
 
     # ------------------------------------------------------------------
@@ -1562,21 +1640,57 @@ class Brain:
     # ------------------------------------------------------------------
 
     def _summarize_steps(self, steps: list[BrainStep]) -> str:
+        """Fallback degraded-path summary. Per-step text is already
+        capped by ``_short_observation`` (~200 chars/step), so this
+        outer aggregate has no need for an additional total cap; the
+        previous 480-char limit chopped mid-line after just ~3 tools
+        and gave users misleading partial summaries.
+        """
         tool_steps = [s for s in steps if s.action == "use_tool" and s.tool_name]
         if not tool_steps:
             return ""
         lines = ["已完成工具链执行："]
         for s in tool_steps:
             lines.append(f"- {s.tool_name}: {_short_observation(s.observation)}")
-        text = "\n".join(lines)
-        return text[:480] + "...(truncated)" if len(text) > 480 else text
+        return "\n".join(lines)
 
-    @staticmethod
-    def _render_observation(*, tool_name: str, observation: Any) -> str:
+    # Token-budget for tool observations injected back into the ReAct
+    # message stream as ``ToolMessage``. Chosen so the largest single
+    # observation can never single-handedly blow a model's context
+    # window (qwen-max 32k worst case → 8k headroom for one obs is safe).
+    # An observation hitting this ceiling means either:
+    #   (a) the tool itself is returning unstructured noise — fix the tool;
+    #   (b) the tool legitimately returns a large list — paginate / summarize
+    #       in the tool layer (job.greet.scan already does ``max_pages``).
+    # Either way the cap fires a warning so we *see* it instead of silently
+    # poisoning the next ReAct step.
+    _MAX_OBSERVATION_TOKENS = 8_000
+
+    @classmethod
+    def _render_observation(cls, *, tool_name: str, observation: Any) -> str:
         body = _serialize(observation).strip()
-        if len(body) > 2000:
-            body = body[:2000] + "...(truncated)"
-        return f"[{tool_name}] {body}"
+        token_n = count_tokens(body)
+        if token_n <= cls._MAX_OBSERVATION_TOKENS:
+            return f"[{tool_name}] {body}"
+        # Fail-loud (warn) and return a *valid JSON diagnostic object*.
+        # Per-tool structured compression (drop verbose fields, keep summary
+        # keys) is a tool's responsibility; Brain's last-resort guard must not
+        # corrupt JSON mid-string and then ask the LLM to reason over it.
+        logger.warning(
+            "tool_observation_oversized tool=%s tokens=%d cap=%d "
+            "→ tool layer should paginate / summarize",
+            tool_name, token_n, cls._MAX_OBSERVATION_TOKENS,
+        )
+        char_cap = cls._MAX_OBSERVATION_TOKENS * 4
+        diagnostic = {
+            "_truncated_by": "brain",
+            "tool_name": tool_name,
+            "original_tokens": token_n,
+            "cap_tokens": cls._MAX_OBSERVATION_TOKENS,
+            "reason": "tool observation exceeded ReAct message budget; fix tool to paginate or summarize",
+            "preview": body[:char_cap],
+        }
+        return f"[{tool_name}] {_serialize(diagnostic)}"
 
 
 # ------------------------------------------------------------------

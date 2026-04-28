@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pulse.core.llm.router import LLMRouter
+from pulse.core.tokenizer import token_preview
 
 from ..memory import JobMemorySnapshot
 from .matcher import MatchResult
@@ -178,7 +179,7 @@ class JobGreeter:
             f"- title: {title}\n"
             f"- company: {company}\n"
             f"- salary: {salary}\n"
-            f"- snippet: {snippet[:800]}"
+            f"- snippet: {token_preview(snippet, max_tokens=400)}"
         )
 
     @staticmethod

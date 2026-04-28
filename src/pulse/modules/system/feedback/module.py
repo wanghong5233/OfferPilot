@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter
 
 from ....core.module import BaseModule
+from ....core.tokenizer import token_preview
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +102,8 @@ class FeedbackLoopModule(BaseModule):
                 (
                     uuid.uuid4().hex,
                     session_id,
-                    content[:2000],
-                    assistant_text[:2000],
+                    token_preview(content, max_tokens=800),
+                    token_preview(assistant_text, max_tokens=800),
                     json.dumps(
                         {
                             "type": feedback_type,

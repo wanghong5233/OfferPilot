@@ -415,11 +415,11 @@ Runtime 发射的**通用事件**（不含任何业务模块名称）：
 |---|---|---|---|---|
 | `system.patrol.list` | `GET /patrols` | F | 0 | F |
 | `system.patrol.status(name)` | `GET /patrols/{name}` | F | 0 | F |
-| `system.patrol.enable(name, trigger_now=true)` | `POST .../enable` | T | 2 | **T** |
+| `system.patrol.enable(name, trigger_now=false)` | `POST .../enable` | T | 2 | **T** |
 | `system.patrol.disable(name)` | `POST .../disable` | T | 1 | F |
 | `system.patrol.trigger(name)` | `POST .../trigger` | T | 2 | **T** |
 
-**`enable` 的 `trigger_now` 编排**(ADR-004 §6.1.4, 2026-04-22 M9.2):runtime 内核 API `enable_patrol(name)` 签名保持 `-> bool` 不变;"enable 同时立刻跑一次"的编排由 `PatrolControlModule._enable_handler` 组合 `enable_patrol + run_patrol_once` 完成。默认 `trigger_now=true` —— 用户表达"开启自动回复"的语义本意是"启动并让我看到它工作",如果仅翻 `ScheduleTask.enabled=true` 并等下一个 `peak_interval_seconds`(典型 180s)用户会读成"没生效"。显式 `trigger_now=false` 用于"挂起来先别跑"场景。
+**`enable` 的 `trigger_now` 编排**:runtime 内核 API `enable_patrol(name)` 签名保持 `-> bool` 不变;`PatrolControlModule._enable_handler` 默认只调用 `enable_patrol`。`trigger_now=true` 时额外组合 `run_patrol_once`。用户表达"开启自动投递 / 自动回复服务"属于生命周期控制,不等价于"现在立刻投递 / 处理一次";后者走 `trigger` 或显式 `trigger_now=true`。
 
 **为什么不走 MCP**:Brain、`BaseModule`、`AgentRuntime` 同进程;MCP 跨进程序列化开销零收益,而且会丢失 runtime 内存引用。Kernel 内部控制面 → in-process `IntentSpec`;跨进程副作用 → MCP(如 `boss_platform_server`)。
 
@@ -485,7 +485,7 @@ def on_startup(self) -> None:
 | `PULSE_JOB_PATROL_CHAT_INTERVAL_PEAK` | `180` | 高峰间隔(秒) |
 | `PULSE_JOB_PATROL_CHAT_INTERVAL_OFFPEAK` | `600` | 低峰间隔(秒) |
 
-业务层 killswitch(如 `PULSE_BOSS_MCP_REPLY_MODE=manual_required`)作用在 handler 内部,与 `ScheduleTask.enabled` 正交,属于"紧急阻断"层,不承担日常启停。
+业务层 killswitch(如 `PULSE_BOSS_MCP_REPLY_MODE=log_only`)作用在 handler 内部,与 `ScheduleTask.enabled` 正交,属于"紧急阻断"层,不承担日常启停。
 
 ### 6.3 BOSS 巡检全流程
 

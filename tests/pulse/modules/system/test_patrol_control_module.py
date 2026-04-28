@@ -15,7 +15,11 @@ from __future__ import annotations
 
 import pytest
 
+from unittest.mock import patch
+
+from pulse.core.action_report import ACTION_REPORT_KEY
 from pulse.core.runtime import AgentRuntime, RuntimeConfig
+from pulse.core.scheduler import PatrolEnabledStateStore
 from pulse.modules.system.patrol.module import PatrolControlModule
 
 
@@ -107,18 +111,8 @@ def test_status_handler_returns_snapshot_for_known_and_error_for_unknown(bound_m
     assert "not found" in miss_out["error"]
 
 
-def test_enable_handler_default_triggers_once_so_user_sees_effect(bound_module) -> None:
-    """End-to-end: default ``trigger_now=True`` flips enabled AND runs
-    one tick immediately.
-
-    Why this matters behaviorally: a user typing "开启自动回复" expects
-    an observable effect now, not one patrol interval later. The handler
-    composes ``enable_patrol`` + ``run_patrol_once`` to give that
-    guarantee without changing the kernel API (``enable_patrol`` itself
-    still returns ``bool``). Observability comes through three
-    co-changing facts: enabled flag flipped, handler ran once (call
-    sink non-empty), and total_runs bumped on the stats snapshot.
-    """
+def test_enable_handler_default_only_flips_enabled(bound_module) -> None:
+    """Plain service enable must arm the patrol without running business IO."""
     mod, rt = bound_module
     executed: list[str] = []
     rt.register_patrol(
@@ -136,22 +130,15 @@ def test_enable_handler_default_triggers_once_so_user_sees_effect(bound_module) 
     assert out["ok"] is True
     assert out["name"] == "alpha"
     assert out["enabled"] is True
-    assert "first_run" in out, (
-        "default trigger_now=True must expose first_run so Brain can surface "
-        "the one-shot outcome to the user without a second round-trip."
-    )
-    assert out["first_run"]["ok"] is True
-    assert out["first_run"]["last_outcome"] == "completed"
-    assert len(executed) == 1, "enable(trigger_now=True) must run the handler exactly once"
+    assert out[ACTION_REPORT_KEY]["action"] == "system.patrol.enable"
+    assert out[ACTION_REPORT_KEY]["summary"] == "已开启后台任务 alpha"
     assert rt.get_patrol_stats("alpha")["enabled"] is True
-    assert rt.get_patrol_stats("alpha")["stats"]["total_runs"] == 1
+    assert executed == []
+    assert rt.get_patrol_stats("alpha")["stats"].get("total_runs", 0) == 0
 
 
-def test_enable_handler_without_trigger_now_only_flips_enabled(bound_module) -> None:
-    """``trigger_now=False`` is the "arm but don't fire" escape hatch
-    for users who want to hand-control the first run (e.g. during
-    debugging or when they explicitly say "挂起来, 先别跑").
-    """
+def test_enable_handler_with_trigger_now_runs_once(bound_module) -> None:
+    """Explicit ``trigger_now=True`` composes enable + one immediate tick."""
     mod, rt = bound_module
     executed: list[str] = []
     rt.register_patrol(
@@ -164,12 +151,18 @@ def test_enable_handler_without_trigger_now_only_flips_enabled(bound_module) -> 
         token_budget=1000,
     )
 
-    out = mod._enable_handler(name="alpha", trigger_now=False)
+    out = mod._enable_handler(name="alpha", trigger_now=True)
 
-    assert out == {"ok": True, "name": "alpha", "enabled": True}
+    assert out["ok"] is True
+    assert out["name"] == "alpha"
+    assert out["enabled"] is True
+    assert out[ACTION_REPORT_KEY]["action"] == "system.patrol.enable"
+    assert out[ACTION_REPORT_KEY]["details"][0]["extras"]["trigger_now"] is True
+    assert out["first_run"]["ok"] is True
+    assert out["first_run"]["last_outcome"] == "completed"
     assert rt.get_patrol_stats("alpha")["enabled"] is True
-    assert executed == [], "trigger_now=False must skip the one-shot run"
-    assert rt.get_patrol_stats("alpha")["stats"].get("total_runs", 0) == 0
+    assert executed == ["patrol:alpha"]
+    assert rt.get_patrol_stats("alpha")["stats"]["total_runs"] == 1
 
 
 def test_disable_handler_flips_observable_state(bound_module) -> None:
@@ -177,26 +170,24 @@ def test_disable_handler_flips_observable_state(bound_module) -> None:
     _register_noop_patrol(rt, "alpha", enabled=True)
 
     disable_out = mod._disable_handler(name="alpha")
-    assert disable_out == {"ok": True, "name": "alpha", "enabled": False}
+    assert disable_out["ok"] is True
+    assert disable_out["name"] == "alpha"
+    assert disable_out["enabled"] is False
+    assert disable_out[ACTION_REPORT_KEY]["action"] == "system.patrol.disable"
     assert rt.get_patrol_stats("alpha")["enabled"] is False
 
 
-def test_enable_intent_schema_declares_trigger_now_default_true(bound_module) -> None:
-    """IntentSpec contract: the schema Brain sees must make trigger_now
-    a visible, defaulted boolean. Without this, Brain has no way to
-    learn "enable implies one-shot" and would keep misrouting to
-    job.chat.process for the 'please start and handle the current
-    backlog' class of utterance (the regression that motivated this
-    test)."""
+def test_enable_intent_schema_declares_trigger_now_default_false(bound_module) -> None:
+    """IntentSpec contract: service-enable utterances must not imply one-shot IO."""
     mod, _ = bound_module
     enable_spec = next(i for i in mod.intents if i.name == "system.patrol.enable")
 
     trigger_prop = enable_spec.parameters_schema["properties"].get("trigger_now")
     assert trigger_prop is not None, "enable schema must expose trigger_now"
     assert trigger_prop["type"] == "boolean"
-    assert trigger_prop["default"] is True, (
-        "default must be True — aligns tool semantics with what '开启' means "
-        "to the user (start AND show me it working)."
+    assert trigger_prop["default"] is False, (
+        "default must be False — '开启自动投递服务' arms the long-running patrol, "
+        "it does not mean '投递一批 now'."
     )
     assert "name" in enable_spec.parameters_schema.get("required", [])
     assert "trigger_now" not in enable_spec.parameters_schema.get("required", []), (
@@ -232,7 +223,34 @@ def test_trigger_handler_runs_patrol_and_returns_outcome(bound_module) -> None:
     assert out["ok"] is True
     assert out["task_name"] == "alpha"
     assert out["last_outcome"] == "completed"
+    assert out[ACTION_REPORT_KEY]["action"] == "system.patrol.trigger"
     assert len(executed) == 1
+
+
+def test_enable_handler_returns_ok_false_when_persistence_fails(tmp_path) -> None:
+    """If the store cannot persist the lifecycle decision, the handler
+    must return ``ok=False`` so the LLM speaks the truth — never the
+    silent "已开启 but actually OFF after reload" trap that triggered
+    this whole rework (post-mortem trace_753fecf70cc5)."""
+    store = PatrolEnabledStateStore(path=tmp_path / "p.json")
+    rt = AgentRuntime(config=RuntimeConfig(), patrol_state_store=store)
+    rt.register_patrol(
+        name="alpha",
+        handler=lambda ctx: None,
+        peak_interval=60,
+        offpeak_interval=120,
+        enabled=False,
+        active_hours_only=False,
+        token_budget=1000,
+    )
+    mod = PatrolControlModule()
+    mod.bind_runtime(rt)
+
+    with patch.object(store, "record", side_effect=OSError("disk full")):
+        out = mod._enable_handler(name="alpha")
+
+    assert out["ok"] is False
+    assert "persistence failed" in out["error"]
 
 
 def test_unbound_module_raises_runtime_error(bound_module) -> None:

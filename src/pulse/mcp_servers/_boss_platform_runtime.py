@@ -14,6 +14,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
 
+from pulse.core.tokenizer import token_preview
 from pulse.core.tools.web_search import search_web
 
 logger = logging.getLogger(__name__)
@@ -855,7 +856,7 @@ def _extract_jobs_from_page(
                 "salary": str(row.get("salary") or "").strip() or None,
                 "location": raw_location or None,
                 "source_url": source_url,
-                "snippet": snippet[:1000],
+                "snippet": token_preview(snippet, max_tokens=700),
                 "source": "boss_mcp_browser_scan",
                 "collected_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -1398,7 +1399,7 @@ def _extract_conversations_from_body_text(page: Any, *, max_items: int) -> list[
                         "hr_name": hr_name,
                         "company": company,
                         "job_title": job_title,
-                        "latest_message": message[:2000],
+                        "latest_message": token_preview(message, max_tokens=1000),
                         "latest_time": token[:40],
                         "unread_count": 0,
                         "source": "boss_mcp_browser_chat",
@@ -1439,7 +1440,7 @@ def _extract_job_leads_from_chat_page(
                 "company": company[:80],
                 "salary": None,
                 "source_url": source_url,
-                "snippet": latest_message[:1000],
+                "snippet": token_preview(latest_message, max_tokens=700),
                 "source": "boss_mcp_browser_chat_lead",
                 "collected_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -1574,7 +1575,7 @@ def _normalize_conversation_rows(
                 "hr_name": hr_name[:80],
                 "company": company[:120],
                 "job_title": job_title[:160],
-                "latest_message": latest_message[:2000],
+                "latest_message": token_preview(latest_message, max_tokens=1000),
                 "latest_time": str(row.get("latest_time") or "").strip()[:40],
                 "unread_count": max(
                     0,
@@ -2154,7 +2155,7 @@ def _enrich_rows_with_latest_hr_message(
                 timeout=detail_timeout_ms,
             )
             text = str(page.evaluate(read_hr_js) or "").strip()
-            row["latest_message"] = text[:2000]
+            row["latest_message"] = token_preview(text, max_tokens=1000)
             row["hr_has_spoken"] = bool(text)
             if text:
                 logger.info(
@@ -2245,7 +2246,17 @@ def _pull_conversations_via_browser(
     # 执行失败) 必须翻译成 status=executor_error, 绝不能让异常吞成 rows=0
     # 的"空结果"伪装 (checklist §类型A "伪造空结果"零容忍).
     try:
-        _ensure_chat_list_hydrated(page)
+        list_container = _ensure_chat_list_hydrated(page)
+        if not list_container:
+            return {
+                "ok": False,
+                "status": "no_result",
+                "items": [],
+                "unread_total": 0,
+                "source": "boss_mcp_browser_chat",
+                "errors": ["chat list container selector did not match"],
+                "url": current_url,
+            }
         tab_selector = _switch_chat_tab(page, chat_tab=chat_tab)
         rows = _resilient_extract_conversations_from_page(
             page, max_items=max(10, safe_max * 2)
@@ -3896,7 +3907,7 @@ def scan_jobs(
                     "company": company,
                     "salary": None,
                     "source_url": source_url,
-                    "snippet": str(hit.snippet or "")[:1000],
+                    "snippet": token_preview(str(hit.snippet or ""), max_tokens=700),
                     "source": "boss_mcp_web_search",
                     "collected_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -4115,7 +4126,7 @@ def reply_conversation(
             "conversation_hint": dict(conversation_hint or {}),
         }
     )
-    mode = str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "manual_required") or "").strip().lower()
+    mode = str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "browser") or "").strip().lower()
     if mode in {"log_only", "dry_run_ok"}:
         # Killswitch 干跑: status 必须是 "logged_only" (不是普通 "logged"),
         # 让 service.py 通过 _TRUE_DELIVERY_STATUSES 白名单识别为非发送。
@@ -4283,9 +4294,8 @@ def send_resume_attachment(
 
     Mirrors the surface of :func:`reply_conversation` but the delivery
     channel is an actual file upload / built-in resume menu click rather
-    than a plain-text message. Falls back to ``manual_required`` when the
-    executor mode is not browser-driven so the business layer can escalate
-    to HITL instead of silently pretending it was sent.
+    than a plain-text message. Unknown executor modes fail closed so the
+    business layer never mistakes a dry run for delivery.
     """
     safe_conv = str(conversation_id or "").strip()
     safe_profile = str(resume_profile_id or "default").strip() or "default"
@@ -4334,7 +4344,7 @@ def send_resume_attachment(
         }
     )
 
-    mode = str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "manual_required") or "").strip().lower()
+    mode = str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "browser") or "").strip().lower()
     if mode in {"log_only", "dry_run_ok"}:
         logger.warning(
             "boss_mcp.killswitch.dry_run op=send_resume_attachment mode=%s "
@@ -4414,7 +4424,7 @@ def click_conversation_card(
         }
     )
 
-    mode = str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "manual_required") or "").strip().lower()
+    mode = str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "browser") or "").strip().lower()
     if mode in {"log_only", "dry_run_ok"}:
         logger.warning(
             "boss_mcp.killswitch.dry_run op=click_conversation_card mode=%s "
@@ -4772,10 +4782,8 @@ def health() -> dict[str, Any]:
         "scan_mode": _scan_mode(),
         "pull_mode": _pull_mode(),
         "seed_fallback_enabled": _allow_seed_fallback(),
-        # Defaults MUST stay in lock-step with greet_job() / send_reply() readers
-        # (see v2.1 ADR-001 §4.4.3). greet 默认 browser (真正投递); reply 保守保留
-        # manual_required 默认, 回复 HR 风险更高.
-        "reply_mode": str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "manual_required")).strip() or "manual_required",
+        # Defaults MUST stay in lock-step with mutating action readers.
+        "reply_mode": str(os.getenv("PULSE_BOSS_MCP_REPLY_MODE", "browser")).strip() or "browser",
         "greet_mode": str(os.getenv("PULSE_BOSS_MCP_GREET_MODE", "browser")).strip() or "browser",
         # P3f: "off" = BOSS 平台代发 APP 预设话术 (默认, 与真实账号配置一致);
         # "on" = Pulse 点完 "立即沟通" 再 fill + send greeting_text 作为第二条.

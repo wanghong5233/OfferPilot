@@ -342,18 +342,18 @@ Step A 把 `run_auto_reply_cycle` 做成可被 MCP tool / 脚本调用的 rule-b
 |---|---|---|---|---|---|
 | `system.patrol.list` | — | F | 0 | F | `runtime.list_patrols()` |
 | `system.patrol.status` | `name: str` | F | 0 | F | `runtime.get_patrol_stats(name)` |
-| `system.patrol.enable` | `name: str`, `trigger_now: bool = true` | T | 2 | **T** | `runtime.enable_patrol(name)` + (条件)`runtime.run_patrol_once(name)` |
+| `system.patrol.enable` | `name: str`, `trigger_now: bool = false` | T | 2 | **T** | `runtime.enable_patrol(name)` + (条件)`runtime.run_patrol_once(name)` |
 | `system.patrol.disable` | `name: str` | T | 1 | F | `runtime.disable_patrol(name)` |
 | `system.patrol.trigger` | `name: str` | T | 2 | **T** | `runtime.run_patrol_once(name)` |
 
 职责边界(`when_not_to_use` 摘录):
 - `list` vs `status`:没给 name 用 list,指定 name 用 status
-- `enable`(默认 `trigger_now=true`) vs `trigger`:enable 翻 `ScheduleTask.enabled=true` **并**立刻跑一次(编排在 `PatrolControlModule._enable_handler`,非 runtime 内核契约);`trigger` 只跑一次,**不**改 `enabled` 标志。用户说"只跑这一次不要开" → `trigger`;用户说"开启 / 启动 / 托管 / 帮我持续监听" → `enable`
-- `enable` + `job.chat.process` 的分流:"长程监听 / 持续处理新消息" → `enable(name="job_chat.patrol")`;"就扫一次当前未读,跑完别再跑" → `job.chat.process`(同步 tool)。`job.chat.process.when_not_to_use` 显式把前一种意图回流给 enable,避免 trace_7a4be7958c5b 类误路由
+- `enable`(默认 `trigger_now=false`) vs `trigger`:enable 翻 `ScheduleTask.enabled=true`,不立即跑业务 tick;`trigger` 只跑一次,**不**改 `enabled` 标志。用户说"只跑这一次不要开" → `trigger`;用户说"开启 / 启动 / 托管 / 帮我持续监听" → `enable`;用户明确说"开启并马上处理一次" → `enable(trigger_now=true)`
+- `enable` + `job.chat.process` / `job.greet.trigger` 的分流:"长程监听 / 持续处理新消息 / 自动投递服务" → `enable(name="job_chat.patrol" 或 "job_greet.patrol")`;"就扫一次当前未读,跑完别再跑" → `job.chat.process`;"现在立刻投一批" → `job.greet.trigger`。业务 tool 的 `when_not_to_use` 显式把长程意图回流给 enable。
 - `disable` vs `/api/runtime/pause`:前者关单条,后者关所有(升级 / 接管场景)
 - `enable` 不绕过业务层 killswitch:`PULSE_BOSS_AUTOREPLY=off` 仍会让 handler return `{status:"disabled"}`;enable 只是把 patrol 放回调度队列,不改业务语义
 
-**`trigger_now` 默认 `true` 的理由**(2026-04-22 M9.2):用户说"开启自动回复"的意思是"启动并让我看到它在工作",不是"仅置位,等一个 interval 再跑"。若默认 `false`,典型 peak_interval=180s 会让用户 UI 侧没有任何反馈,读作"没开起来"。`trigger_now=false` 仅保留给显式"挂起来先别跑"语义。enable 与 trigger 是两次独立 kernel 调用,中间存在极小窗口可能被下一 scheduler tick 抢先(最多多跑一次);业务侧 `JobChatService.run_process` 对 `conversation_id` 已做幂等去重,该风险可接受。
+**`trigger_now` 默认 `false` 的理由**:服务开启是控制面操作,应快速返回并等待调度窗口;立即跑一次是业务面操作,可能触发浏览器、LLM 和平台副作用。`trigger_now=true` 只用于用户显式要求"现在跑一次 / 顺便处理当前未读 / 马上投一批"的复合意图。
 
 ### 6.1.5 事件契约
 
@@ -400,7 +400,7 @@ IntentSpec 和 HTTP 路由**语义完全对等**,共享同一底层 `AgentRuntim
 | `Pulse-内核架构总览.md` §5.2 契约行追加 | `docs/Pulse-内核架构总览.md` | ✅ 已落地 |
 | `docs/README.md` ADR 清单 + `Pulse实施计划.md` M9 里程碑 | 两文件 | ✅ 已落地 |
 | §6.1.1 修订(IM 独占启停 + 删 env killswitch + register 无条件)回归修复 trace_0cf87040e0e5 | `modules/job/config.py`、`modules/job/chat/module.py`、`modules/job/greet/module.py`、`core/runtime.py`(默认 `enabled=False`)、测试 1 条 | ✅ 已落地(2026-04-22 M9.1) |
-| §6.1.4 `system.patrol.enable` 增 `trigger_now: bool = true`;`_enable_handler` 编排 enable + 立即 `run_patrol_once`;`job.chat.process.when_not_to_use` 加"长程监听 → `system.patrol.enable`"回流锚点。回归修复 trace_7a4be7958c5b(Brain 把"开启自动回复"误路由到 `job.chat.process`) | `modules/system/patrol/module.py`、`modules/job/chat/module.py`、`tests/pulse/modules/system/test_patrol_control_module.py` 新增 2 条 | ✅ 已落地(2026-04-22 M9.2) |
+| §6.1.4 `system.patrol.enable` 保留 `trigger_now`,默认 `false`;`_enable_handler` 默认只 enable,显式 `trigger_now=true` 才组合 `run_patrol_once`;`job.chat.process` / `job.greet.trigger` 的 `when_not_to_use` 加"长程服务 → `system.patrol.enable`"回流锚点 | `modules/system/patrol/module.py`、`modules/job/chat/module.py`、`modules/job/greet/module.py`、`tests/pulse/modules/system/test_patrol_control_module.py` | ✅ 已落地 |
 | §6.1 chat-list 脚手架:`_switch_chat_tab` 改 snapshot-change 判据(pre/post 首行签名对比 + `networkidle` + 3s poll budget,替换原 `wait_for_timeout(700)`);新增 `_resilient_extract_conversations_from_page`(3 次 attempt + `networkidle` + 递增 backoff,与 jobs 侧 `_resilient_extract_jobs_from_page` 对齐);`_pull_conversations_via_browser` 切换到 resilient 变体 + 新增 `pull_conversations_via_browser` 结构化 log 行。回归修复 trace_7a4be7958c5b 的"tab 切换但 list 仍是全部消息 → extract 返回 [] → LLM 说无未读"失败链 | `mcp_servers/_boss_platform_runtime.py`、`tests/pulse/mcp_servers/test_boss_chat_pull_timing.py` 新增 6 条 | ✅ 已落地(2026-04-22 M9.2) |
 | §6.1 运行期可观察性:`boss_platform_gateway` 关闭 uvicorn 默认 access log(过滤 `/health` noise),`/call` 端点改手工 `logger.info("mcp_call tool=... status=... elapsed_ms=...")`,保留业务可观察性;`start.sh monitor_loop` 改 state-change-only(首次 baseline + 状态码变化时打印,不再每 20s `[SYS] idle`) | `mcp_servers/boss_platform_gateway.py`、`scripts/start.sh` | ✅ 已落地(2026-04-22 M9.2) |
 | §6.1 B3(`fetch_latest_hr` 真逐条点会话抓详情)合同前置:需先在 `docs/dom-specs/boss/chat-detail/` 补一轮 tab-switched 后的 DOM dump 并锁合同,再开代码实现 | — | ⏳ 推迟到 PR-2(ADR-004 §6.1 追加决策 E,本轮范围外) |

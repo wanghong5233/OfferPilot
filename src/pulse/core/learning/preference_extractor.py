@@ -282,7 +282,7 @@ class PreferenceExtractor:
             "3) domain_prefs (list[dict]): **业务域**结构化意图, 由下游 "
             "DomainPreferenceDispatcher 派发到 DomainMemory.\n"
             "   凡是求职域的 {偏好城市 / 目标岗位 / 期望薪资 / 实习 or 全职 / "
-            "公司黑白名单 / 不重复投递等规则 / 已投记录} 一律从这里出, "
+            "公司黑白名单 / 不重复投递等规则 / 已投记录 / 抽象择业目标} 一律从这里出, "
             "**严禁**同步写进 core_prefs.\n"
             "   每条 dict 形如: {\n"
             "     \"domain\": \"job\",\n"
@@ -322,8 +322,13 @@ class PreferenceExtractor:
             "       错误: {\"op\":\"constraint_note\",\"args\":{\"content\":\"...\"}}  "
             "← op 槽不能直接放 type.\n"
             "     item.type 选择:\n"
-            "       - constraint_note: 用户下的**规则/指令**, 例如\"已经联系过的不要"
-            "重复投递\"、\"不要大厂\"、\"优先小厂/初创\".\n"
+            "       - constraint_note: 用户下的**流程规则/叙事规则**, 例如\"已经联系过的不要"
+            "重复投递\"、\"秋招叙事要顺畅\".\n"
+            "       - avoid_trait: 用户明确回避的岗位/公司类型, 例如\"不要大厂\"、"
+            "\"暂时战略性放弃大厂暑期实习\" → target=\"大厂\".\n"
+            "       - favor_trait: 用户偏好的岗位/公司/业务特质, 例如\"业务垂直匹配\"、"
+            "\"互联网垂直实习\"、\"含金量高\"、\"小厂/初创深度垂直实习\"、"
+            "\"大模型应用前沿\".\n"
             "       - application_event: 已经**发生**的投递事件 (必须有具体 company+URL), "
             "\"我投过 X\" 这种才记; 没有具体公司/URL → 用 constraint_note.\n"
             "       - avoid_company / favor_company: 公司黑白名单(含类型描述, "
@@ -335,7 +340,7 @@ class PreferenceExtractor:
             "  - 如果没识别到任何信号, 返回 {core_prefs:{}, soul_updates:{}, "
             "domain_prefs:[], evidences:[]}.\n"
             "  - 输出合法 JSON, 不要 markdown fence, 不要解释文字.\n\n"
-            f"用户消息: {text[:1200]}"
+            f"用户消息: {text}"
         )
 
     @staticmethod

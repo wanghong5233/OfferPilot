@@ -297,7 +297,7 @@ cp .env.example .env
 # Edit .env: OPENAI_API_KEY or DASHSCOPE_API_KEY, and DATABASE_URL
 
 pip install -e .[dev]
-pulse start
+./scripts/start.sh all
 ```
 
 API docs: <http://localhost:8010/docs>  
@@ -316,12 +316,13 @@ docker compose up --build
 # First-time BOSS login (browser QR; cookies persist under ~/.pulse/boss_browser_profile)
 ./scripts/boss_login.sh
 
-# Enable patrol in .env
-PULSE_JOB_PATROL_GREET_ENABLED=true
-PULSE_JOB_PATROL_CHAT_ENABLED=true
+# Enable long-running scheduling, then turn patrols on via chat or runtime API
 AGENT_RUNTIME_ENABLED=true
+PULSE_SAFETY_PLANE=enforce
+curl -X POST http://localhost:8010/api/runtime/patrols/job_greet.patrol/enable
+curl -X POST http://localhost:8010/api/runtime/patrols/job_chat.patrol/enable
 
-# After restart, AgentRuntime enters active hours; one patrol every 15 minutes during peak window
+# AgentRuntime respects each patrol's active hours and interval
 ```
 
 ### Claude Desktop / Cursor (as MCP Server)

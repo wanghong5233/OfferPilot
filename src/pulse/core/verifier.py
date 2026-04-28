@@ -596,9 +596,9 @@ class CommitmentVerifier:
             SystemMessage(content=_JUDGE_SYSTEM),
             HumanMessage(
                 content=_JUDGE_USER_TEMPLATE.format(
-                    query=(query or "").strip()[:400],
-                    raw_reply=(raw_reply or "").strip()[:1600],
-                    shaped_reply=(shaped_reply or "").strip()[:800],
+                    query=(query or "").strip(),
+                    raw_reply=(raw_reply or "").strip(),
+                    shaped_reply=(shaped_reply or "").strip(),
                     turn_evidence_json=evidence_json,
                 )
             ),

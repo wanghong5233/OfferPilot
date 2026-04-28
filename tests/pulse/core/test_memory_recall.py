@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from pulse.core.memory.recall_memory import RecallMemory
 from tests.pulse.support.fakes import FakeRecallDB
 
@@ -53,3 +55,63 @@ def test_recall_memory_keyword_any_vs_all() -> None:
 
     all_hits = memory.search_keyword(keywords=["拼多多", "字节"], match="all", top_k=10)
     assert all_hits == []
+
+
+def test_recall_memory_skips_adjacent_duplicate_interaction() -> None:
+    db = FakeRecallDB()
+    memory = RecallMemory(db_engine=db)
+
+    first = memory.add_interaction(
+        user_text="帮我开启自动投递",
+        assistant_text="已开启自动投递。",
+        session_id="s",
+    )
+    duplicate = memory.add_interaction(
+        user_text="  帮我开启自动投递\n",
+        assistant_text="已开启自动投递。 ",
+        session_id="s",
+    )
+
+    assert first["deduped"] is False
+    assert duplicate["deduped"] is True
+    assert memory.count() == 2
+    assert [row["role"] for row in memory.recent(limit=10, session_id="s")] == [
+        "user",
+        "assistant",
+    ]
+
+
+def test_recall_memory_keeps_repeated_request_when_answer_changes() -> None:
+    db = FakeRecallDB()
+    memory = RecallMemory(db_engine=db)
+
+    memory.add_interaction(
+        user_text="帮我开启自动投递",
+        assistant_text="失败：缺少登录态。",
+        session_id="s",
+    )
+    second = memory.add_interaction(
+        user_text="帮我开启自动投递",
+        assistant_text="已开启自动投递。",
+        session_id="s",
+    )
+
+    assert second["deduped"] is False
+    assert memory.count() == 4
+
+
+def test_recall_memory_non_json_tool_result_uses_token_preview() -> None:
+    db = FakeRecallDB()
+    memory = RecallMemory(db_engine=db)
+    circular: list[object] = []
+    circular.append(circular)
+
+    memory.record_tool_call(
+        tool_name="debug.non_json",
+        tool_args={},
+        tool_result={"bad": circular, "text": "长文本" * 1000},
+    )
+
+    stored = json.loads(db.tool_calls[0]["tool_result"])
+    assert "_str_preview" in stored
+    assert "preview truncated" in stored["_str_preview"]

@@ -206,6 +206,7 @@ def test_runtime_health_includes_browser_config(monkeypatch) -> None:
     monkeypatch.setenv("PULSE_BOSS_BROWSER_PROFILE_DIR", "./data/.playwright/boss")
     monkeypatch.setenv("PULSE_BOSS_BROWSER_HEADLESS", "false")
     monkeypatch.setenv("PULSE_BOSS_BROWSER_TIMEOUT_MS", "15000")
+    monkeypatch.delenv("PULSE_BOSS_MCP_REPLY_MODE", raising=False)
     monkeypatch.delenv("PULSE_BOSS_BROWSER_STEALTH_ENABLED", raising=False)
     monkeypatch.delenv("PULSE_BOSS_BROWSER_BLOCK_IFRAME_CORE", raising=False)
     health = runtime.health()
@@ -215,6 +216,7 @@ def test_runtime_health_includes_browser_config(monkeypatch) -> None:
     assert int(health["browser"]["timeout_ms"]) >= 3000
     assert "scan_mode" in health
     assert "pull_mode" in health
+    assert health["reply_mode"] == "browser"
     assert health["browser"]["stealth_enabled"] is True
     assert health["browser"]["block_iframe_core"] is False
 
@@ -501,6 +503,13 @@ def test_runtime_pull_conversations_browser_fails_loud_when_dom_empty(monkeypatc
 
         def wait_for_timeout(self, ms: int) -> None:
             _ = ms
+
+        def bring_to_front(self) -> None:
+            return None
+
+        def evaluate(self, script: str):  # noqa: ANN001
+            _ = script
+            return {}
 
     monkeypatch.setattr(runtime, "_ensure_browser_page", lambda: _FakePage())
     result = runtime._pull_conversations_via_browser(

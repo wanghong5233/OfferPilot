@@ -88,7 +88,9 @@ modules/job/
 - **做**：把 `JobMemorySnapshot` + 当前上下文渲染进 Prompt，让 LLM 做**语义决策**（匹配分 / 打招呼话术 / 回复草稿 / 消息分类）。
 - **共同契约**：
   - 输入统一包含 `JobMemorySnapshot`（保证「用户偏好对所有 LLM 组件可见」）。
-  - 必须有 heuristic fallback，用于 LLM 不可用 / 超时 / JSON 解析失败时的降级。
+  - 真实外发动作前的语义判断必须 LLM 成功；LLM 不可用 / 超时 / JSON 解析失败时跳过候选并记录审计。
+  - `greet` 使用 `job_match` 路由；`chat` 使用 `job_chat` 路由。两者均为 OpenAI 强模型优先、Qwen Max 稳定别名回退。
+  - 只读扫描可以保留弱排序信号,不得把弱排序作为自动外发依据。
   - 不直接写 `JobMemory`；对记忆的任何 mutation 都要回到 Brain 的 IntentSpec 路径。
 
 ### 3.6 JobMemory（领域记忆 facade）
@@ -208,10 +210,10 @@ class MemoryItem:
 | `avoid_company` | 回避公司 | 公司名 |
 | `favor_company` | 偏好公司 | 公司名 |
 | `avoid_trait` | 回避特质（岗位/公司层面） | "加班多" / "晋升不透明" / null |
-| `favor_trait` | 偏好特质 | "远程" / "技术栈 Rust" / null |
+| `favor_trait` | 偏好特质 | "业务垂直匹配" / "含金量高" / "技术栈 Rust" / null |
 | `application_event` | 投递/面试事件 | 公司名 |
 | `capability_claim` | 能力自评（但简历是 ground truth） | null 或 技能名 |
-| `constraint_note` | 其他约束说明 | 自由 |
+| `constraint_note` | 其他约束说明 | "秋招叙事要顺畅" / 自由 |
 | `other` | 任何未归类 | 自由 |
 
 **Key 命名**：
@@ -312,7 +314,7 @@ Snapshot 按三类分节，渲染给 matcher / greeter / replier / Brain 系统 
 - [拼多多] 笔试挂过，暂不考虑
 
 ### Memory Items — favor_trait
-- 偏好远程或混合办公
+- 偏好互联网垂直实习，业务要合适、垂直匹配、含金量高
 - 喜欢技术栈含 Rust 或 Go
 
 ### Memory Items — application_event
@@ -361,6 +363,10 @@ Snapshot 按三类分节，渲染给 matcher / greeter / replier / Brain 系统 
 
 | 情形 | 倾向 |
 |------|------|
+| `job_greet.patrol` 定时打招呼 | 用户启用 patrol 后自动执行；候选不确定时跳过,不逐条 ASK |
+| `job_chat.patrol` 发简历 / 换简历卡片 | BOSS 预定义求职动作,自动执行并审计 |
+| `job_chat.patrol` 文本回复 | Planner 判定可回答时自动执行；需要用户实时事实 / 承诺时 ASK |
+| 面试时间 / 交换联系方式 / 到岗承诺 | ASK / Suspend / Resume |
 | 用户已明确说出偏好（"不投字节"） | 一般无需确认；回执「已记录」 |
 | 从弱上下文推断的写入（LLM 自行归纳的 claim） | **需确认**，尤其 `capability_claim` |
 | 批量失效（一次 retire 5 条以上） | 需确认 |
@@ -377,7 +383,7 @@ Snapshot 按三类分节，渲染给 matcher / greeter / replier / Brain 系统 
 | `HrMessagePlanner` | HR 消息 + snapshot | 判断 reply / send_resume / accept_card / escalate |
 | `HrReplier` | HR 消息 + snapshot + 简历 | 生成符合用户偏好 + 不出简历范围的回复 |
 
-**批量优化**：`JobSnapshotMatcher` 支持对一批候选岗位一次 LLM 调用（JD 列表 + 同一 snapshot），避免每岗位一次 LLM 的成本爆炸。
+自动外发链路不使用语义启发式兜底。LLM 输出无效时，`greet` 跳过候选，`chat` 升级为用户输入。
 
 ---
 

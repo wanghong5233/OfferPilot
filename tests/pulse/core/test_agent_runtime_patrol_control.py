@@ -108,10 +108,14 @@ def test_enable_and_disable_patrol_flip_scheduler_flag_and_emit_lifecycle_events
         for etype, payload in sink.events
         if etype.startswith("runtime.patrol.lifecycle.")
     ]
-    assert lifecycle == [
-        ("runtime.patrol.lifecycle.enabled", {"task_name": "alpha"}),
-        ("runtime.patrol.lifecycle.disabled", {"task_name": "alpha"}),
+    assert [etype for etype, _ in lifecycle] == [
+        "runtime.patrol.lifecycle.enabled",
+        "runtime.patrol.lifecycle.disabled",
     ]
+    assert all(payload.get("task_name") == "alpha" for _, payload in lifecycle)
+    # Every lifecycle event carries an actor tag (defaulting to "system")
+    # so post-mortem audits can answer "who flipped this".
+    assert all("actor" in payload for _, payload in lifecycle)
 
 
 def test_enable_disable_unknown_patrol_return_false_and_emit_no_event(runtime) -> None:

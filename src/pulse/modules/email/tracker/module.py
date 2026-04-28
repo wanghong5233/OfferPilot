@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from ....core.llm.router import LLMRouter
 from ....core.module import BaseModule
 from ....core.storage.engine import DatabaseEngine
+from ....core.tokenizer import token_preview
 
 logger = logging.getLogger(__name__)
 
@@ -161,31 +162,31 @@ def _extract_time(text: str) -> str | None:
     return None
 
 
-def _classify_heuristic(sender: str, subject: str, body: str) -> dict[str, Any]:
+def _classify_by_rules(sender: str, subject: str, body: str) -> dict[str, Any]:
     text = f"{subject}\n{body}".lower()
     company = _extract_company(sender, subject, body)
     interview_time = _extract_time(f"{subject}\n{body}")
     if any(key in text for key in ("面试", "interview", "一面", "二面", "三面")):
         email_type = "interview_invite"
         confidence = 0.82
-        reason = "Contains interview keywords"
+        reason = "deterministic_rule: interview keyword"
         job_status = "interview"
     elif any(key in text for key in ("未通过", "不合适", "感谢投递", "rejected", "regret")):
         email_type = "rejection"
         confidence = 0.86
-        reason = "Contains rejection keywords"
+        reason = "deterministic_rule: rejection keyword"
         job_status = "rejected"
         interview_time = None
     elif any(key in text for key in ("补充", "补交", "材料", "作品集", "portfolio", "resume")):
         email_type = "need_material"
         confidence = 0.75
-        reason = "Contains material-request keywords"
+        reason = "deterministic_rule: material request keyword"
         job_status = "need_material"
         interview_time = None
     else:
         email_type = "irrelevant"
         confidence = 0.6
-        reason = "No high-confidence hiring keywords found"
+        reason = "deterministic_rule: no high-confidence hiring keyword"
         job_status = None
         interview_time = None
     return {
@@ -195,6 +196,7 @@ def _classify_heuristic(sender: str, subject: str, body: str) -> dict[str, Any]:
             "interview_time": interview_time,
             "confidence": confidence,
             "reason": reason,
+            "classifier": "deterministic_rule",
         },
         "related_job_id": None if company is None else f"job::{company.lower()}",
         "updated_job_status": job_status,
@@ -240,7 +242,7 @@ def _extract_text_body(msg: Message) -> str:
                 text = payload.decode("utf-8", errors="ignore")
             text = text.strip()
             if text:
-                return text[:4000]
+                return token_preview(text, max_tokens=1200)
     payload = msg.get_payload(decode=True)
     if payload is None:
         return ""
@@ -249,7 +251,7 @@ def _extract_text_body(msg: Message) -> str:
         text = payload.decode(charset, errors="ignore")
     except Exception:
         text = payload.decode("utf-8", errors="ignore")
-    return text.strip()[:4000]
+    return token_preview(text.strip(), max_tokens=1200)
 
 
 def _parse_schedule_time(text: str | None) -> datetime | None:
@@ -363,9 +365,9 @@ class EmailTrackerModule(BaseModule):
             "{\"email_type\":\"interview_invite|rejection|need_material|irrelevant\","
             "\"company\":\"...\",\"interview_time\":\"... or empty\","
             "\"confidence\":0.0,\"reason\":\"...\",\"updated_job_status\":\"... or empty\"}\n\n"
-            f"Sender: {sender[:200]}\n"
-            f"Subject: {subject[:500]}\n"
-            f"Body: {body[:2000]}"
+            f"Sender: {token_preview(sender, max_tokens=80)}\n"
+            f"Subject: {token_preview(subject, max_tokens=160)}\n"
+            f"Body: {token_preview(body, max_tokens=900)}"
         )
         try:
             raw = self._llm_router.invoke_text(prompt, route="classification")
@@ -392,8 +394,8 @@ class EmailTrackerModule(BaseModule):
                 "updated_job_status": updated_job_status,
             }
         except Exception as exc:
-            logger.warning("email llm classification failed, fallback to heuristic: %s", exc)
-            return _classify_heuristic(sender, subject, body)
+            logger.warning("email llm classification failed; using deterministic rules: %s", exc)
+            return _classify_by_rules(sender, subject, body)
 
     def _persist_email_event(self, *, mail: _EmailItem, result: dict[str, Any]) -> None:
         classification = dict(result.get("classification") or {})
@@ -408,7 +410,7 @@ class EmailTrackerModule(BaseModule):
                 event_id,
                 mail.sender,
                 mail.subject,
-                mail.body[:4000],
+                token_preview(mail.body, max_tokens=1200),
                 str(classification.get("email_type") or "irrelevant"),
                 classification.get("company"),
                 classification.get("interview_time"),

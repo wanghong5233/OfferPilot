@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Any
 
+from ..tokenizer import token_preview
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,7 +58,7 @@ class BehaviorAnalyzer:
         summary_lines: list[str] = []
         for entry in history[-30:]:
             role = str(entry.get("role") or "")
-            text = str(entry.get("text") or "")[:150]
+            text = token_preview(str(entry.get("text") or ""), max_tokens=80)
             summary_lines.append(f"[{role}] {text}")
         conversation = "\n".join(summary_lines)
 
@@ -71,7 +73,7 @@ class BehaviorAnalyzer:
             "Return a JSON array of proposed preferences:\n"
             '[{"key": "...", "value": "...", "evidence": "...", "confidence": 0.0-1.0}]\n'
             "Return ONLY valid JSON array. Empty array if no patterns found.\n\n"
-            f"Conversation:\n{conversation[:3000]}"
+            f"Conversation:\n{token_preview(conversation, max_tokens=1600)}"
         )
         raw = self._llm_router.invoke_text(instruction, route="classification")
         cleaned = raw.strip()

@@ -39,6 +39,7 @@ from .mcp_transport_stdio import StdioMCPTransport
 from .module import ModuleRegistry
 from .profile import ProfileCoordinator
 from .runtime import AgentRuntime, RuntimeConfig
+from .scheduler import PatrolEnabledStateStore
 from .task_context import create_interactive_context
 from .prompt_contract import PromptContractBuilder
 from .hooks import HookContext, HookRegistry, HookResult, HookPoint
@@ -446,7 +447,15 @@ def create_app(
         workspace_memory=workspace_memory,
     )
     tool_specs = list(tool_registry.list_tools())
-    prompt_builder = PromptContractBuilder(memory=memory_reader, tool_specs=tool_specs)
+    # Keep prompt-budget metadata behind LLMRouter's model-selection API.
+    # Server should not duplicate route ordering or model-window lookup.
+    _primary_model = llm_router.primary_model("planning")
+    prompt_builder = PromptContractBuilder(
+        memory=memory_reader,
+        tool_specs=tool_specs,
+        max_input_tokens=llm_router.input_token_budget("planning"),
+        tokenizer_model=_primary_model,
+    )
     # 收集所有 module 的 domain snapshot provider, 注入 Brain system prompt。
     # 见 docs/Pulse-DomainMemory与Tool模式.md §3.3 / §5.3。
     for _mod in module_registry.modules:
@@ -1073,6 +1082,10 @@ def create_app(
         if policy.action != "safe":
             response["handled"] = False
             response["result"] = None
+            response["reply"] = (
+                f"⚠️ 这条请求被路由策略拦截了：{policy.reason or policy.action}。"
+                f"如需继续请换种方式表达或解除限制。"
+            )
             response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
             _emit_event(
                 "channel.message.blocked",
@@ -1093,6 +1106,10 @@ def create_app(
             response["handled"] = False
             response["result"] = None
             response["error"] = f"target module not found: {target_name or '-'}"
+            response["reply"] = (
+                f"⚠️ 路由命中目标模块 `{target_name}` 但当前未注册（可能是模块加载失败）。"
+                f"请检查后端启动日志。"
+            )
             response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
             _emit_event(
                 "channel.message.error",
@@ -1153,7 +1170,17 @@ def create_app(
             response["result"] = None
             response["error"] = str(exc)[:500]
             response["mode"] = "brain"
+            response["reply"] = (
+                f"⚠️ 处理你的消息时后端出现异常：{type(exc).__name__}: {str(exc)[:300]}。"
+                f"trace_id={trace_id}，请查看后端日志定位。"
+            )
             response["latency_ms"] = int((time.perf_counter() - started_at) * 1000)
+            logger.exception(
+                "brain.run failed for trace_id=%s channel=%s: %s",
+                trace_id,
+                message.channel,
+                exc,
+            )
             _emit_event(
                 "brain.run.failed",
                 {
@@ -1176,6 +1203,7 @@ def create_app(
 
         response["handled"] = bool(brain_result.answer or brain_result.used_tools)
         response["mode"] = "brain"
+        response["reply"] = brain_result.answer
         response["brain"] = brain_result.to_dict()
         if module_result is not None:
             response["result"] = module_result
@@ -1263,6 +1291,9 @@ def create_app(
         adapter.set_handler(_dispatch_channel_message)
 
     runtime_config = RuntimeConfig()
+    patrol_state_store = PatrolEnabledStateStore(
+        path=Path(os.path.expanduser(settings.patrol_state_path)),
+    )
     agent_runtime = AgentRuntime(
         event_emitter=event_bus.publish if event_bus else None,
         config=runtime_config,
@@ -1271,6 +1302,7 @@ def create_app(
         promotion_engine=promotion,
         recall_memory=recall_memory,
         workspace_memory=workspace_memory,
+        patrol_state_store=patrol_state_store,
     )
 
     for module in module_registry.modules:
@@ -1645,14 +1677,20 @@ def create_app(
 
     @app.post("/api/runtime/patrols/{name}/enable")
     async def runtime_patrol_enable(name: str) -> dict[str, Any]:
-        ok = agent_runtime.enable_patrol(name)
+        try:
+            ok = agent_runtime.enable_patrol(name, actor="rest")
+        except OSError as exc:
+            return {"ok": False, "error": f"patrol enable persistence failed: {exc}"}
         if not ok:
             return {"ok": False, "error": f"patrol not found or not controllable: {name}"}
         return {"ok": True, "result": {"name": name, "enabled": True}}
 
     @app.post("/api/runtime/patrols/{name}/disable")
     async def runtime_patrol_disable(name: str) -> dict[str, Any]:
-        ok = agent_runtime.disable_patrol(name)
+        try:
+            ok = agent_runtime.disable_patrol(name, actor="rest")
+        except OSError as exc:
+            return {"ok": False, "error": f"patrol disable persistence failed: {exc}"}
         if not ok:
             return {"ok": False, "error": f"patrol not found or not controllable: {name}"}
         return {"ok": True, "result": {"name": name, "enabled": False}}
@@ -2821,10 +2859,13 @@ def create_app(
 
         reply_text = ""
         if isinstance(result, dict):
+            reply_text = str(result.get("reply") or result.get("answer") or "")
+            if not reply_text and "brain" in result:
+                reply_text = ""
             brain_result = result.get("result")
-            if isinstance(brain_result, dict):
+            if not reply_text and "brain" not in result and isinstance(brain_result, dict):
                 reply_text = str(brain_result.get("answer") or brain_result.get("text") or "")
-            elif isinstance(brain_result, str):
+            elif not reply_text and "brain" not in result and isinstance(brain_result, str):
                 reply_text = brain_result
         if reply_text:
             adapter.send(OutgoingMessage(

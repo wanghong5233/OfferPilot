@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter
 
+from ....core.action_report import ACTION_REPORT_KEY, ActionDetail, ActionReport
 from ....core.module import BaseModule, IntentSpec
 
 
@@ -62,20 +63,45 @@ class PatrolControlModule(BaseModule):
             return {"ok": False, "name": name, "error": f"patrol not found: {name}"}
         return {"ok": True, "name": name, "patrol": snapshot}
 
+    @staticmethod
+    def _lifecycle_report(
+        *,
+        action: str,
+        name: str,
+        status: str,
+        summary: str,
+        trigger_now: bool | None = None,
+    ) -> dict[str, Any]:
+        extras: dict[str, Any] = {}
+        if trigger_now is not None:
+            extras["trigger_now"] = trigger_now
+        return ActionReport.build(
+            action=action,
+            status=status,  # type: ignore[arg-type]
+            summary=summary,
+            details=[
+                ActionDetail(
+                    target=name,
+                    status=status,  # type: ignore[arg-type]
+                    extras=extras,
+                )
+            ],
+            metrics={"succeeded": 1 if status == "succeeded" else 0},
+        ).to_dict()
+
     def _enable_handler(
         self,
         *,
         name: str,
-        trigger_now: bool = True,
+        trigger_now: bool = False,
     ) -> dict[str, Any]:
-        """Flip the patrol ON and (by default) run one tick immediately.
+        """Flip the patrol ON; only run immediately when explicitly requested.
 
-        ``trigger_now`` defaults to ``True`` because "开启自动回复" as a
-        user utterance implies "start it AND let me see it work" — if we
-        only flipped ``enabled`` the user would wait up to one full
-        ``peak_interval_seconds`` before seeing any effect, which reads
-        as "nothing happened". Scheduler semantics stay intact: this is
-        just a one-shot trigger on top of the normal tick schedule.
+        "开启自动投递/自动回复服务" is a lifecycle command: arm the background
+        patrol and return quickly. Running the business tick synchronously here
+        turns a control-plane operation into "do one delivery now", blocks the
+        chat response behind browser/LLM work, and violates the user's mental
+        model of a long-running service.
 
         enable + trigger are two separate kernel calls; between them
         another scheduler tick could in theory grab its own first run,
@@ -86,14 +112,36 @@ class PatrolControlModule(BaseModule):
         """
 
         runtime = self._resolve_runtime()
-        ok = runtime.enable_patrol(name)
+        try:
+            ok = runtime.enable_patrol(name, actor="im:brain.tool")
+        except OSError as exc:
+            # Persistence failed (disk full, perms, etc). Refuse to claim
+            # success — otherwise the LLM tells the user "已开启" and the
+            # next reload silently turns it off again. Fail-loud: surface
+            # the underlying error so the LLM can speak the truth.
+            return {
+                "ok": False,
+                "name": name,
+                "error": f"patrol enable persistence failed: {exc}",
+            }
         if not ok:
             return {
                 "ok": False,
                 "name": name,
                 "error": f"patrol not found or not controllable: {name}",
             }
-        result: dict[str, Any] = {"ok": True, "name": name, "enabled": True}
+        result: dict[str, Any] = {
+            "ok": True,
+            "name": name,
+            "enabled": True,
+            ACTION_REPORT_KEY: self._lifecycle_report(
+                action="system.patrol.enable",
+                name=name,
+                status="succeeded",
+                summary=f"已开启后台任务 {name}",
+                trigger_now=trigger_now,
+            ),
+        }
         if trigger_now:
             first_run = runtime.run_patrol_once(name)
             result["first_run"] = first_run
@@ -101,18 +149,43 @@ class PatrolControlModule(BaseModule):
 
     def _disable_handler(self, *, name: str) -> dict[str, Any]:
         runtime = self._resolve_runtime()
-        ok = runtime.disable_patrol(name)
+        try:
+            ok = runtime.disable_patrol(name, actor="im:brain.tool")
+        except OSError as exc:
+            return {
+                "ok": False,
+                "name": name,
+                "error": f"patrol disable persistence failed: {exc}",
+            }
         if not ok:
             return {
                 "ok": False,
                 "name": name,
                 "error": f"patrol not found or not controllable: {name}",
             }
-        return {"ok": True, "name": name, "enabled": False}
+        return {
+            "ok": True,
+            "name": name,
+            "enabled": False,
+            ACTION_REPORT_KEY: self._lifecycle_report(
+                action="system.patrol.disable",
+                name=name,
+                status="succeeded",
+                summary=f"已关闭后台任务 {name}",
+            ),
+        }
 
     def _trigger_handler(self, *, name: str) -> dict[str, Any]:
         runtime = self._resolve_runtime()
-        return runtime.run_patrol_once(name)
+        result = runtime.run_patrol_once(name)
+        if isinstance(result, dict) and result.get("ok"):
+            result[ACTION_REPORT_KEY] = self._lifecycle_report(
+                action="system.patrol.trigger",
+                name=name,
+                status="succeeded",
+                summary=f"已触发后台任务 {name} 执行一次",
+            )
+        return result
 
     def _build_intents(self) -> list[IntentSpec]:
         name_schema = {
@@ -193,9 +266,8 @@ class PatrolControlModule(BaseModule):
             IntentSpec(
                 name="system.patrol.enable",
                 description=(
-                    "Turn ON a patrol and (by default) execute one tick "
-                    "immediately so the user sees an effect without waiting "
-                    "a full interval. Mutates in-memory ScheduleTask.enabled; "
+                    "Turn ON a patrol. Executes one immediate tick only when "
+                    "trigger_now=true. Mutates in-memory ScheduleTask.enabled; "
                     "no persistence (restart falls back to module initial state). "
                     "Does NOT bypass business-layer killswitch env vars — if "
                     "the handler itself is disabled it still returns disabled."
@@ -207,9 +279,9 @@ class PatrolControlModule(BaseModule):
                     "'把 job_chat.patrol 打开', '启动自动投递 patrol', "
                     "'start auto reply', 'turn on the chat patrol'. "
                     "这是\"用户要让某个后台循环工作跑起来\"的唯一正确 intent — "
-                    "即便用户同一句话里还描述了\"顺便处理一下当前未读消息\", "
-                    "也应优先选本工具 (默认 trigger_now=true 会立刻处理一次), "
-                    "不要改走 job.chat.process 之类的同步即时 intent."
+                    "不要改走 job.chat.process / job.greet.trigger 之类的同步即时 intent. "
+                    "服务型表达默认只设置 enabled=true; 只有用户明确说\"现在立刻跑一次 / "
+                    "顺便处理当前未读 / 马上投一批\"才把 trigger_now 设为 true."
                 ),
                 when_not_to_use=(
                     "用户只想了解状态 — 用 list/status; "
@@ -232,13 +304,13 @@ class PatrolControlModule(BaseModule):
                         "trigger_now": {
                             "type": "boolean",
                             "description": (
-                                "If true (default), run one tick immediately "
-                                "after flipping enabled=true so the user sees "
-                                "an effect without waiting a full interval. "
-                                "Set to false only when the user explicitly "
-                                "says 'just arm it, do not run yet'."
+                                "If true, run one tick immediately after flipping "
+                                "enabled=true. Default is false: "
+                                "plain service-enable utterances must return quickly "
+                                "and wait for the scheduler window. Set true only "
+                                "when the user explicitly asks to run once now."
                             ),
-                            "default": True,
+                            "default": False,
                         },
                     },
                     "required": ["name"],
@@ -252,7 +324,11 @@ class PatrolControlModule(BaseModule):
                 examples=[
                     {
                         "input": "开启自动回复",
-                        "kwargs": {"name": "job_chat.patrol"},
+                        "kwargs": {"name": "job_chat.patrol", "trigger_now": False},
+                    },
+                    {
+                        "input": "开启自动投递服务",
+                        "kwargs": {"name": "job_greet.patrol", "trigger_now": False},
                     },
                     {
                         "input": "帮我开启 boss 的自动消息回复, 处理一下未读",

@@ -165,14 +165,23 @@ class WechatWorkBotAdapter(BaseChannelAdapter):
         self._task = asyncio.create_task(self._run_forever())
 
     async def _run_forever(self) -> None:
-        try:
-            await self._client.connect_async()
-            while self._client and self._client.is_connected:
-                await asyncio.sleep(1)
-        except asyncio.CancelledError:
-            logger.info("wechat-work-bot task cancelled")
-        except Exception as e:
-            logger.error("wechat-work-bot connection error: %s", e)
+        reconnect_delay = 1.0
+        while True:
+            try:
+                if self._client is None:
+                    raise RuntimeError("wechat-work-bot client is not initialized")
+                await self._client.connect_async()
+                reconnect_delay = 1.0
+                while self._client and self._client.is_connected:
+                    await asyncio.sleep(1)
+                logger.warning("wechat-work-bot connection ended; reconnecting")
+            except asyncio.CancelledError:
+                logger.info("wechat-work-bot task cancelled")
+                raise
+            except (ConnectionError, OSError, RuntimeError) as exc:
+                logger.warning("wechat-work-bot connection error: %s", exc)
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30.0)
 
     async def stop(self) -> None:
         if self._task and not self._task.done():
@@ -197,6 +206,29 @@ def _extract_reply(result: Any) -> str:
     if isinstance(result, str):
         return result
     if isinstance(result, dict):
+        top_level_reply = str(result.get("reply") or result.get("answer") or "").strip()
+        if top_level_reply:
+            return top_level_reply
+        if "brain" in result:
+            # Successful brain envelope but empty answer — keep silent
+            # (Brain decided not to reply). Don't surface the error field
+            # here even if upstream attached one for audit; success path
+            # is authoritative.
+            logger.warning("_extract_reply: standard dispatch envelope has no reply")
+            return ""
+        # No brain field → server bailed out before Brain finished
+        # (policy block / module not found / brain.run raised). Surface
+        # the error so the bot doesn't go silent and hide backend bugs.
+        envelope_error = str(result.get("error") or "").strip()
+        if envelope_error:
+            trace_id = str(result.get("trace_id") or "").strip()
+            logger.warning(
+                "_extract_reply: dispatch envelope reports error: %s (trace_id=%s)",
+                envelope_error,
+                trace_id or "-",
+            )
+            tail = f"，trace_id={trace_id}" if trace_id else ""
+            return f"⚠️ 后端处理失败：{envelope_error[:300]}{tail}"
         # Try nested result.result first (standard Brain response)
         brain_result = result.get("result")
         if isinstance(brain_result, dict):
@@ -211,10 +243,9 @@ def _extract_reply(result: Any) -> str:
             return text
         if isinstance(brain_result, str):
             return brain_result
-        # Fallback: top-level keys
-        text = str(result.get("answer") or result.get("text") or "")
-        if not text:
-            logger.warning("_extract_reply: unrecognized result structure: %s", list(result.keys()))
-        return text
+        # Top-level ``text`` in the standard channel dispatch envelope is the
+        # user's original message, not an assistant reply. Never echo it.
+        logger.warning("_extract_reply: unrecognized result structure: %s", list(result.keys()))
+        return ""
     logger.warning("_extract_reply: unexpected type %s", type(result).__name__)
     return ""

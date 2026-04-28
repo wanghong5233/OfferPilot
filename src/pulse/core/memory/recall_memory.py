@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..storage.engine import DatabaseEngine
+from ..tokenizer import token_preview
 from .envelope import MemoryEnvelope, MemoryKind
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,11 @@ def _parse_metadata(raw: Any) -> dict[str, Any]:
             return {}
         return dict(parsed) if isinstance(parsed, dict) else {}
     return {}
+
+
+def _normalize_turn_text(value: Any) -> str:
+    """Canonical text for adjacent duplicate-turn detection."""
+    return " ".join(str(value or "").strip().split())
 
 
 class RecallMemory:
@@ -168,11 +174,48 @@ class RecallMemory:
         workspace_id: str | None = None,
     ) -> dict[str, Any]:
         safe_session_id = str(session_id or "default").strip() or "default"
+        safe_user_text = str(user_text or "").strip()
+        safe_assistant_text = str(assistant_text or "").strip()
         safe_metadata = dict(metadata or {})
         safe_metadata["session_id"] = safe_session_id
+
+        # Mature long-running assistants keep a sliding recent window. If the
+        # same IM event is replayed or the user double-sends the exact same
+        # request and receives the exact same answer, persisting another pair
+        # only pushes useful context out of that window. Dedupe is intentionally
+        # adjacent and exact after whitespace normalization: repeated intent
+        # with a different answer remains valuable evidence and must be kept.
+        recent_dialog = [
+            row for row in self.recent(
+                limit=6,
+                session_id=safe_session_id,
+                workspace_id=workspace_id,
+            )
+            if str(row.get("role") or "") in {"user", "assistant"}
+        ]
+        if len(recent_dialog) >= 2:
+            last_user, last_assistant = recent_dialog[-2], recent_dialog[-1]
+            if (
+                str(last_user.get("role") or "") == "user"
+                and str(last_assistant.get("role") or "") == "assistant"
+                and _normalize_turn_text(last_user.get("text")) == _normalize_turn_text(safe_user_text)
+                and _normalize_turn_text(last_assistant.get("text")) == _normalize_turn_text(safe_assistant_text)
+            ):
+                logger.info(
+                    "recall_memory: skipped adjacent duplicate interaction session=%s workspace=%s",
+                    safe_session_id,
+                    workspace_id,
+                )
+                return {
+                    "user_id": str(last_user.get("id") or ""),
+                    "assistant_id": str(last_assistant.get("id") or ""),
+                    "total": self.count(),
+                    "deduped": True,
+                }
+
         user_entry = self._insert_entry(
             role="user",
-            text=str(user_text or "").strip(),
+            text=safe_user_text,
             metadata=safe_metadata,
             session_id=safe_session_id,
             task_id=task_id,
@@ -181,7 +224,7 @@ class RecallMemory:
         )
         assistant_entry = self._insert_entry(
             role="assistant",
-            text=str(assistant_text or "").strip(),
+            text=safe_assistant_text,
             metadata=safe_metadata,
             session_id=safe_session_id,
             task_id=task_id,
@@ -192,6 +235,7 @@ class RecallMemory:
             "user_id": user_entry["id"],
             "assistant_id": assistant_entry["id"],
             "total": self.count(),
+            "deduped": False,
         }
 
     def add_entry(self, *, role: str, text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -349,18 +393,23 @@ class RecallMemory:
 
         items: list[dict[str, Any]] = []
         for row_id, entry_role, text, metadata_raw, entry_session, entry_task, entry_run, entry_workspace, created_at in rows:
+            text_value = str(text or "")
+            matched = [kw for kw in kw_list if kw.lower() in text_value.lower()]
+            lexical_similarity = len(matched) / max(1, len(kw_list))
             items.append(
                 {
                     "id": str(row_id),
                     "role": str(entry_role or ""),
-                    "text": str(text or ""),
+                    "text": text_value,
                     "session_id": str(entry_session or ""),
                     "task_id": str(entry_task or ""),
                     "run_id": str(entry_run or ""),
                     "workspace_id": str(entry_workspace or ""),
                     "timestamp": str(created_at.isoformat() if hasattr(created_at, "isoformat") else created_at or ""),
                     "metadata": _parse_metadata(metadata_raw),
-                    "matched_keywords": [kw for kw in kw_list if kw.lower() in str(text or "").lower()],
+                    "matched_keywords": matched,
+                    "similarity": lexical_similarity,
+                    "score_source": "keyword",
                 }
             )
         return items
@@ -397,7 +446,10 @@ class RecallMemory:
                     "preview tool=%s err=%s",
                     tool_name, exc,
                 )
-                result_json = json.dumps({"_str": str(tool_result)[:2000]})
+                result_json = json.dumps(
+                    {"_str_preview": token_preview(str(tool_result), max_tokens=500)},
+                    ensure_ascii=False,
+                )
         self._db.execute(
             """
             INSERT INTO tool_calls(id, conversation_id, session_id, task_id, run_id, workspace_id,

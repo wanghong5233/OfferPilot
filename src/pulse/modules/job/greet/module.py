@@ -195,7 +195,7 @@ class JobGreetModule(BaseModule):
             keyword=self._settings.greet_default_keyword,
             batch_size=None,
             match_threshold=None,
-            confirm_execute=not self._settings.hitl_required,
+            confirm_execute=self._settings.greet_auto_execute,
             fetch_detail=True,
         )
 
@@ -252,8 +252,9 @@ class JobGreetModule(BaseModule):
 
         不再走 ``handle_intent`` + regex 参数抽取; Brain 依据 JSON Schema 结构化
         抽参后调用 handler。两个 intent 都**不写入 memory** (``mutates=False``),
-        但 ``trigger`` 会向 BOSS 发真实招呼, 故 ``risk_level=2`` 且业务层靠
-        ``GreetPolicy.hitl_required`` 做 HITL 门控。
+        但 ``trigger`` 会向 BOSS 发真实招呼, 故 ``risk_level=2``。定时 patrol
+        由 ``PULSE_JOB_GREET_AUTO_EXECUTE`` 控制是否自动真发; 交互式 trigger
+        仍用 ``confirm_execute`` 区分预览 / 执行。
 
         见 ``docs/Pulse-DomainMemory与Tool模式.md`` §4.3 / §7.3 M1。
         """
@@ -400,16 +401,20 @@ class JobGreetModule(BaseModule):
                 description=(
                     "MUTATING: send real greetings to top matches on the recruiting platform. "
                     "Reuses the scan_handle from a previous job.greet.scan (preferred) or runs "
-                    "its own scan as fallback. Respects daily_limit, blocked companies/keywords, "
-                    "and HITL confirm_execute gate."
+                    "its own scan when no handle is supplied. Respects daily_limit, blocked "
+                    "companies/keywords, and the confirm_execute preview/execution switch."
                 ),
                 when_to_use=(
-                    "唯一**真实**在招聘平台下发打招呼的通道: scan → match_threshold → policy filter → send。"
+                    "唯一**一次性立即**在招聘平台下发打招呼的通道: scan → match_threshold → policy filter → send。"
                     "副作用: 平台侧消息发送、daily_limit 计数自增、greeted_urls 落盘。"
                     "`confirm_execute` 两态 (true=真发, false=仅预览) 如何选 —— "
                     "**唯一判据是本轮用户话语的语义类别**, 规则写在 `confirm_execute` 参数 description, "
                     "不要在这里/上层重复启发式判断. 任何\"投递/打招呼/批量 greet\"类动作"
                     "**必须**经此工具, 不得在 host 侧用 scan 结果伪装投递。"
+                    "但用户说的是\"开启自动投递/自动打招呼服务/后台定时跑\"时, "
+                    "那是 patrol 生命周期控制, 必须走 "
+                    "`system.patrol.enable(name=\"job_greet.patrol\", trigger_now=false)`, "
+                    "不是本工具。"
                     "**契约 B hand-off**: 如果刚在上一步调过 `job.greet.scan`, **必须**把它返回的 "
                     "`scan_handle` 传进来, 否则会重复扫一遍 (浪费一次 MCP 浏览器调用 + 可能触发 "
                     "`fetch_detail=True` 超时)。"
@@ -571,6 +576,7 @@ class JobGreetModule(BaseModule):
                     "mode": "real_connector" if self._service.connector.execution_ready else "degraded_connector",
                     "provider": self._service.connector.provider_name,
                     "hitl_required": self._service.policy.hitl_required,
+                    "auto_execute": self._settings.greet_auto_execute,
                     "greet_log_path": str(self._service_greet_log_path()),
                     "connector": connector_health,
                     "weekday_guard": {

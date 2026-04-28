@@ -25,7 +25,11 @@ from uuid import uuid4
 
 from .hooks import HookPoint, HookRegistry
 from .logging_config import set_trace_id
-from .scheduler import BackgroundSchedulerRunner, ScheduleTask
+from .scheduler import (
+    BackgroundSchedulerRunner,
+    PatrolEnabledStateStore,
+    ScheduleTask,
+)
 from .scheduler.windows import is_active_hour
 from .task_context import (
     ExecutionMode,
@@ -191,6 +195,7 @@ class AgentRuntime:
         promotion_engine: Any | None = None,
         recall_memory: Any | None = None,
         workspace_memory: Any | None = None,
+        patrol_state_store: PatrolEnabledStateStore | None = None,
     ) -> None:
         self._config = config or RuntimeConfig()
         self._event_emitter = event_emitter
@@ -199,6 +204,13 @@ class AgentRuntime:
         self._promotion = promotion_engine
         self._recall_memory = recall_memory
         self._workspace_memory = workspace_memory
+        # ADR-004 §6.1.1 v2 (post-mortem 2026-04-28): patrol enabled-state is
+        # **durable**, not in-memory. ``register_patrol`` rehydrates from the
+        # store at boot; ``enable_patrol`` / ``disable_patrol`` write through
+        # so a uvicorn reload / restart never silently flips a long-running
+        # service back to OFF behind the user's back. ``None`` here disables
+        # persistence (used by isolated unit tests that don't care).
+        self._patrol_state_store = patrol_state_store
         self._runner = BackgroundSchedulerRunner(
             tick_seconds=self._config.tick_seconds,
         )
@@ -275,11 +287,26 @@ class AgentRuntime:
 
         self._patrol_handlers[name] = (handler, workspace_id, token_budget)
 
+        # Rehydrate prior user lifecycle decision (ADR-004 §6.1.1 v2).
+        # Modules call register_patrol(enabled=False) by design — the
+        # *user* is the source of truth for "should this be running".
+        # If the store recorded a prior ``enabled=True``, honor it on
+        # boot so reload/restart doesn't silently disarm long-running
+        # services. Stored ``enabled=False`` is also honored (lets the
+        # user keep things paused across restarts).
+        rehydrated_from_store = False
+        effective_enabled = bool(enabled)
+        if self._patrol_state_store is not None:
+            record = self._patrol_state_store.get(name)
+            if record is not None:
+                effective_enabled = record.enabled
+                rehydrated_from_store = True
+
         task = ScheduleTask(
             name=name,
             interval_seconds=peak_interval,
             handler=_wrapped_handler,
-            enabled=enabled,
+            enabled=effective_enabled,
             run_immediately=True,
             peak_interval_seconds=peak_interval,
             offpeak_interval_seconds=offpeak_interval,
@@ -301,8 +328,9 @@ class AgentRuntime:
             "circuit_open": False,
         }
         logger.info(
-            "Registered patrol: %s  peak=%ds  offpeak=%ds  enabled=%s",
-            name, peak_interval, offpeak_interval, enabled,
+            "Registered patrol: %s  peak=%ds  offpeak=%ds  enabled=%s%s",
+            name, peak_interval, offpeak_interval, effective_enabled,
+            " (rehydrated from state store)" if rehydrated_from_store else "",
         )
 
     # -- structured patrol execution ----------------------------------------
@@ -683,31 +711,65 @@ class AgentRuntime:
             return None
         return self._patrol_snapshot(name)
 
-    def enable_patrol(self, name: str) -> bool:
+    def enable_patrol(self, name: str, *, actor: str = "system") -> bool:
         """Turn a patrol ON at runtime. Returns True on success, False if
         unknown or is internal heartbeat. Emits
         ``runtime.patrol.lifecycle.enabled`` on success.
+
+        Persists the decision through ``patrol_state_store`` so reload /
+        restart honors it (ADR-004 §6.1.1 v2). Persistence failures are
+        loud (raise) — the runtime refuses to claim "enabled" if it
+        cannot also persist the fact, otherwise the bot ends up lying
+        again post-reload. Caller (``system.patrol.enable`` handler)
+        catches and surfaces as ``ok=False`` to the LLM.
         """
         if name == self._heartbeat_task_name:
             return False
         ok = self._runner.engine.set_enabled(name, True)
         if ok:
-            self._emit("runtime.patrol.lifecycle.enabled", {"task_name": name})
-            logger.info("Patrol enabled: %s", name)
+            self._persist_patrol_state(name=name, enabled=True, actor=actor)
+            self._emit(
+                "runtime.patrol.lifecycle.enabled",
+                {"task_name": name, "actor": actor},
+            )
+            logger.info("Patrol enabled: %s actor=%s", name, actor)
         return ok
 
-    def disable_patrol(self, name: str) -> bool:
+    def disable_patrol(self, name: str, *, actor: str = "system") -> bool:
         """Turn a patrol OFF at runtime. Returns True on success, False if
         unknown or is internal heartbeat. Emits
-        ``runtime.patrol.lifecycle.disabled`` on success.
+        ``runtime.patrol.lifecycle.disabled`` on success. Persists the
+        decision so a later reload doesn't accidentally re-enable a
+        patrol the user turned off.
         """
         if name == self._heartbeat_task_name:
             return False
         ok = self._runner.engine.set_enabled(name, False)
         if ok:
-            self._emit("runtime.patrol.lifecycle.disabled", {"task_name": name})
-            logger.info("Patrol disabled: %s", name)
+            self._persist_patrol_state(name=name, enabled=False, actor=actor)
+            self._emit(
+                "runtime.patrol.lifecycle.disabled",
+                {"task_name": name, "actor": actor},
+            )
+            logger.info("Patrol disabled: %s actor=%s", name, actor)
         return ok
+
+    def _persist_patrol_state(self, *, name: str, enabled: bool, actor: str) -> None:
+        if self._patrol_state_store is None:
+            return
+        try:
+            self._patrol_state_store.record(
+                name=name, enabled=enabled, actor=actor,
+            )
+        except OSError as exc:
+            # Fail-loud: a runtime that says "enabled" but can't persist it
+            # will silently lie after the next reload — exactly the bug
+            # this store is meant to kill. Surface upward.
+            logger.error(
+                "patrol_state_store: persist failed name=%s enabled=%s err=%s",
+                name, enabled, exc,
+            )
+            raise
 
     def run_patrol_once(self, name: str) -> dict[str, Any]:
         """Execute one tick of a patrol right now, bypassing interval

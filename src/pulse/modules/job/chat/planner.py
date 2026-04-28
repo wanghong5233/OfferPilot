@@ -13,7 +13,7 @@ drawn from :class:`pulse.modules.job.shared.enums.ChatAction`.
     保守地 ESCALATE 到人工又让长程自动回复失去意义. 因此 planner 的
     默认积极动作是 ``send_resume``; 只有两种情况例外:
       * UI 系统噪音 (如 "您正在与 Boss 某某沟通" / "对方已暂停沟通") → IGNORE
-      * 真正敏感话题 (薪资谈判 / 线下面试时间 / offer 比较) → ESCALATE
+      * 需要用户实时事实或谈判承诺的话题 → ESCALATE
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ import logging
 from dataclasses import dataclass
 
 from pulse.core.llm.router import LLMRouter
+from pulse.core.tokenizer import token_preview
 
 from ..memory import JobMemorySnapshot
 from ..shared.enums import CardAction, CardType, ChatAction, ConversationInitiator
@@ -51,7 +52,7 @@ class PlannedChatAction:
 
 
 class HrMessagePlanner:
-    """LLM-backed classifier with a deterministic heuristic fallback."""
+    """LLM-backed classifier; invalid LLM output escalates to user input."""
 
     def __init__(self, llm_router: LLMRouter) -> None:
         self._llm = llm_router
@@ -76,11 +77,6 @@ class HrMessagePlanner:
         退化到纯消息分类, 用于不持有 snapshot 的调用方 (如单元测试)。
         """
         safe_message = str(message or "").strip()
-        if not safe_message:
-            return PlannedChatAction(
-                action=ChatAction.IGNORE,
-                reason="empty message",
-            )
         if has_exchange_resume_card:
             # HR sent an explicit UI-level request — skip LLM guessing and
             # surface it for HITL confirmation by suggesting accept.
@@ -90,13 +86,21 @@ class HrMessagePlanner:
                 card_type=CardType.EXCHANGE_RESUME,
                 card_action=CardAction.ACCEPT,
             )
+        if not safe_message:
+            return PlannedChatAction(
+                action=ChatAction.IGNORE,
+                reason="empty message",
+            )
         llm_plan = self._plan_with_llm(
             safe_message,
             snapshot=snapshot,
             company=company,
             job_title=job_title,
         )
-        plan = llm_plan if llm_plan is not None else self._plan_with_heuristic(safe_message)
+        plan = llm_plan if llm_plan is not None else PlannedChatAction(
+            action=ChatAction.ESCALATE,
+            reason="llm_required_no_heuristic_chat_action",
+        )
         return self._apply_initiator_policy(plan, initiated_by=initiated_by)
 
     # ---------------------------------------------------------------- LLM
@@ -124,8 +128,9 @@ class HrMessagePlanner:
             "Pick the single safest action in this priority order:\n"
             "  1. If HR represents a company/keyword the user has blocked → escalate "
             "(do NOT auto reply and do NOT send the resume).\n"
-            "  2. Sensitive negotiation topics (具体薪资 / 线下面试时间 / offer "
-            "比较 / 到岗细节) → escalate for HITL.\n"
+            "  2. Questions that require the user's real-time facts or commitments "
+            "(今天/明天是否有空, 具体面试时间, 电话沟通时间, 具体薪资谈判, offer 比较, "
+            "到岗细节) → escalate for user input.\n"
             "  3. Interactive card cue (HR sent 交换简历 card etc.) → accept_card "
             "(already handled upstream — only pick this if the text literally "
             "quotes a card prompt).\n"
@@ -148,7 +153,7 @@ class HrMessagePlanner:
         )
         user_prompt = (
             f"## Conversation context\n{context_md}\n\n"
-            f"## Latest HR message\n{message[:1200]}\n\n"
+            f"## Latest HR message\n{token_preview(message, max_tokens=800)}\n\n"
             "Return JSON only."
         )
 
@@ -157,7 +162,7 @@ class HrMessagePlanner:
                 _system(system_prompt),
                 _user(user_prompt),
             ],
-            route="classification",
+            route="job_chat",
         )
         if not isinstance(parsed, dict):
             return None
@@ -169,62 +174,6 @@ class HrMessagePlanner:
         reply_text = str(parsed.get("reply_text") or "").strip() or None
         return PlannedChatAction(action=action, reason=reason, reply_text=reply_text)
 
-    # ---------------------------------------------------------------- heuristic
-
-    _UI_NOISE_TOKENS: tuple[str, ...] = (
-        "您正在与",
-        "您已收到招呼",
-        "对方已暂停沟通",
-        "系统消息",
-    )
-    _SENSITIVE_TOKENS: tuple[str, ...] = (
-        "薪资",
-        "月薪",
-        "offer",
-        "面试时间",
-        "线下面试",
-        "到岗时间",
-        "电话沟通",
-    )
-    _EXPLICIT_RESUME_TOKENS: tuple[str, ...] = (
-        "简历",
-        "resume",
-        "作品集",
-        "附件",
-    )
-
-    @classmethod
-    def _plan_with_heuristic(cls, message: str) -> PlannedChatAction:
-        """Heuristic fallback used ONLY when LLM classification is unavailable.
-
-        积极默认是 ``SEND_RESUME`` — 求职者收到任何真实 HR 消息都应该先把
-        简历递过去. 只有两类例外: 纯 UI 噪音升不到有效信号 → ``IGNORE``;
-        敏感话题 (薪资/offer/线下) 超出 auto-reply 责任 → ``ESCALATE``.
-        """
-        stripped = message.strip()
-        if not stripped:
-            return PlannedChatAction(action=ChatAction.IGNORE, reason="empty message")
-        lowered = stripped.lower()
-        if any(token in stripped for token in cls._UI_NOISE_TOKENS):
-            return PlannedChatAction(
-                action=ChatAction.IGNORE,
-                reason="BOSS 系统 UI 噪音, 非真实 HR 消息",
-            )
-        if any(token in stripped or token in lowered for token in cls._SENSITIVE_TOKENS):
-            return PlannedChatAction(
-                action=ChatAction.ESCALATE,
-                reason="敏感话题 (薪资/线下/offer) — 需 HITL 确认",
-            )
-        if any(token in stripped or token in lowered for token in cls._EXPLICIT_RESUME_TOKENS):
-            return PlannedChatAction(
-                action=ChatAction.SEND_RESUME,
-                reason="HR 明确要求简历材料",
-            )
-        return PlannedChatAction(
-            action=ChatAction.SEND_RESUME,
-            reason="HR 主动抛球 — 按求职者默认先递简历",
-        )
-
     # ---------------------------------------------------------------- policy
 
     @staticmethod
@@ -233,27 +182,9 @@ class HrMessagePlanner:
         *,
         initiated_by: ConversationInitiator,
     ) -> PlannedChatAction:
-        """Post-filter based on who opened the conversation.
-
-        历史版本在此把所有 HR-initiated 非 card 动作一刀切升到 ESCALATE, 动机
-        是 "未验证公司怕泄露信号". 这与用户诉求冲突: 用户明确要求 HR 一上来就
-        把简历发过去, 信号泄露风险由上游的 avoid_company / blocked_keyword
-        负责. 因此这里只做一件事 — 把极少数 LLM 回了 IGNORE 但消息本身并非
-        UI 噪音的边缘情况兜底为 SEND_RESUME, 其余 action 原样透传.
-        """
+        """Post-filter based on who opened the conversation."""
         _ = initiated_by
-        if plan.action != ChatAction.IGNORE:
-            return plan
-        reason = plan.reason or ""
-        if any(token in reason for token in ("UI", "系统", "噪音", "empty")):
-            return plan
-        return PlannedChatAction(
-            action=ChatAction.SEND_RESUME,
-            reason=(
-                f"upgrade_from_ignore: {reason[:100]} — job-seeker default is to "
-                "send resume on any real HR message"
-            ),
-        )
+        return plan
 
 
 def _system(content: str) -> object:

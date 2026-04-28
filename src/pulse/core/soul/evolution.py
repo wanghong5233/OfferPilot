@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from ..tokenizer import token_preview
 from ..learning.domain_preference_dispatcher import (
     DomainPreferenceDispatcher,
 )
@@ -335,7 +336,7 @@ class SoulEvolutionEngine:
                 chosen = str(chosen_raw).strip() if isinstance(chosen_raw, str) else ""
                 rejected = str(rejected_raw).strip() if isinstance(rejected_raw, str) else ""
                 if not chosen:
-                    chosen = f"Follow user correction: {safe_user_text[:300]}"
+                    chosen = f"Follow user correction: {token_preview(safe_user_text, max_tokens=160)}"
                 if not rejected:
                     rejected = str(assistant_text or "").strip() or "N/A"
                 try:

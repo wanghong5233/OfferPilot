@@ -70,10 +70,11 @@ class JobSettings(BaseSettings):
     greet_daily_limit: int = Field(default=50, ge=1, le=500)
     greet_default_keyword: str = Field(default="AI Agent 实习")
     greet_greeting_template: str = Field(default="")
+    greet_auto_execute: bool = Field(default=True)
 
     # chat policy
     chat_default_profile_id: str = Field(default="default")
-    chat_auto_execute: bool = Field(default=False)
+    chat_auto_execute: bool = Field(default=True)
 
     # HITL
     hitl_required: bool = Field(default=True)

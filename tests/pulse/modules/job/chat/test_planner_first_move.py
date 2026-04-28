@@ -1,85 +1,43 @@
-"""Hard contract: planner's first move on any real HR message = send_resume.
-
-求职场景第一性原理: HR 主动发来的任何"真实消息"(寒暄/表达兴趣/简单自我介绍/
-招人广告) 都等价于 "请递简历". IGNORE 只保留给 BOSS 系统 UI 噪音,
-ESCALATE 只保留给真正敏感的谈判话题. 这里锁合同, 防止下次 prompt 或
-heuristic 被无意翻回 "寒暄 → IGNORE" 的旧行为.
-
-这些测试只针对 heuristic + initiator_policy, 不依赖 LLM 路由器, 保证
-CI 稳定 (LLM 返回不可重现).
-"""
+"""Hard contract: planner decisions come from LLM output, not heuristics."""
 
 from __future__ import annotations
-
-import pytest
 
 from pulse.modules.job.chat.planner import HrMessagePlanner, PlannedChatAction
 from pulse.modules.job.shared.enums import ChatAction, ConversationInitiator
 
 
-# ────────────────────────────────────────────────────────────────────
-# 1. heuristic: the fallback when LLM is unavailable
-# ────────────────────────────────────────────────────────────────────
+class _LLM:
+    def __init__(self, response) -> None:  # type: ignore[no-untyped-def]
+        self.response = response
+        self.routes: list[str] = []
+
+    def invoke_json(self, messages, *, route):  # type: ignore[no-untyped-def]
+        self.routes.append(route)
+        return self.response
 
 
-@pytest.mark.parametrize(
-    "message",
-    [
-        "你好，对你之前的经历非常感兴趣",
-        "Hi，我们赞意正在寻找 AI 实习生，请问考虑吗？",
-        "在吗",
-        "你好",
-        "我们这边在找大模型应用方向的同学",
-    ],
-)
-def test_heuristic_defaults_hr_greetings_to_send_resume(message: str) -> None:
-    plan = HrMessagePlanner._plan_with_heuristic(message)
-    assert plan.action == ChatAction.SEND_RESUME, (
-        f"HR greeting {message!r} must heuristically fall back to send_resume "
-        f"(job-seeker default); got {plan.action.value}"
-    )
+def test_llm_classifies_hr_greeting_as_send_resume() -> None:
+    llm = _LLM({"action": "send_resume", "reason": "HR 主动打招呼", "reply_text": ""})
+    plan = HrMessagePlanner(llm).plan(message="你好，对你之前的经历非常感兴趣")
 
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "您正在与Boss周晨业沟通",
-        "您已收到招呼",
-        "对方已暂停沟通",
-    ],
-)
-def test_heuristic_keeps_ui_noise_as_ignore(message: str) -> None:
-    plan = HrMessagePlanner._plan_with_heuristic(message)
-    assert plan.action == ChatAction.IGNORE, (
-        f"BOSS system UI text {message!r} is not a real HR utterance; must stay IGNORE"
-    )
-
-
-@pytest.mark.parametrize(
-    "message",
-    [
-        "方便加个微信聊聊薪资吗",
-        "下周能来线下面试吗",
-        "你现在几个 offer 在手上",
-        "具体的到岗时间是？",
-    ],
-)
-def test_heuristic_escalates_sensitive_negotiation(message: str) -> None:
-    plan = HrMessagePlanner._plan_with_heuristic(message)
-    assert plan.action == ChatAction.ESCALATE, (
-        f"Sensitive negotiation topic {message!r} must escalate to HITL; "
-        f"got {plan.action.value}"
-    )
-
-
-def test_heuristic_empty_message_still_ignored() -> None:
-    plan = HrMessagePlanner._plan_with_heuristic("   ")
-    assert plan.action == ChatAction.IGNORE
-
-
-def test_heuristic_explicit_resume_request_still_send_resume() -> None:
-    plan = HrMessagePlanner._plan_with_heuristic("方便发一份简历吗")
     assert plan.action == ChatAction.SEND_RESUME
+    assert llm.routes == ["job_chat"]
+
+
+def test_llm_failure_escalates_instead_of_heuristic_send_resume() -> None:
+    plan = HrMessagePlanner(_LLM("not-json")).plan(message="你好")
+
+    assert plan.action == ChatAction.ESCALATE
+    assert plan.reason == "llm_required_no_heuristic_chat_action"
+
+
+def test_exchange_resume_card_is_platform_signal_not_semantic_heuristic() -> None:
+    plan = HrMessagePlanner(_LLM("should-not-be-called")).plan(
+        message="",
+        has_exchange_resume_card=True,
+    )
+
+    assert plan.action == ChatAction.ACCEPT_CARD
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -116,16 +74,15 @@ def test_initiator_policy_no_longer_force_escalates_hr_send_resume() -> None:
     assert policed.action == ChatAction.SEND_RESUME
 
 
-def test_initiator_policy_upgrades_ignore_on_real_message_to_send_resume() -> None:
-    """LLM 偶尔会对寒暄也回 IGNORE; policy 层兜底翻为 SEND_RESUME."""
+def test_initiator_policy_does_not_rewrite_llm_ignore() -> None:
     plan = PlannedChatAction(
         action=ChatAction.IGNORE, reason="low-priority greeting"
     )
     policed = HrMessagePlanner._apply_initiator_policy(
         plan, initiated_by=ConversationInitiator.HR
     )
-    assert policed.action == ChatAction.SEND_RESUME
-    assert "upgrade_from_ignore" in policed.reason
+    assert policed.action == ChatAction.IGNORE
+    assert policed.reason == "low-priority greeting"
 
 
 def test_initiator_policy_keeps_ignore_on_ui_noise() -> None:

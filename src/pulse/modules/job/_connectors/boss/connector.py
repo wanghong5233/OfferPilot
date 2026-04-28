@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pulse.core.mcp_transport_http import HttpMCPTransport
+from pulse.core.tokenizer import token_preview
 from pulse.core.tools.web_search import search_web
 
 from ..base import JobPlatformConnector
@@ -763,7 +764,7 @@ class BossPlatformConnector(JobPlatformConnector):
                         "company": "",
                         "salary": None,
                         "source_url": source_url,
-                        "snippet": str(hit.snippet or "")[:1000],
+                        "snippet": token_preview(str(hit.snippet or ""), max_tokens=700),
                         "source": "boss_web_search",
                         "collected_at": datetime.now(timezone.utc).isoformat(),
                     }

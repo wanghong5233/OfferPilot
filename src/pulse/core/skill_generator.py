@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .sandbox import PythonSandbox, SandboxScanResult
+from .tokenizer import token_preview
 from .tool import ToolRegistry, ToolSpec
 
 
@@ -256,7 +257,7 @@ class SkillGenerator:
                 instruction = (
                     "Given the following user request for a tool, infer a concise snake_case tool name "
                     "(max 30 chars, lowercase, only a-z0-9_). Return ONLY the name, nothing else.\n\n"
-                    f"Request: {prompt[:200]}"
+                    f"Request: {token_preview(prompt, max_tokens=160)}"
                 )
                 raw = self._llm_router.invoke_text(instruction, route="classification").strip()
                 name = re.sub(r"[^a-z0-9_]", "", raw.lower().strip("` \n"))

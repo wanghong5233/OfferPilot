@@ -12,13 +12,12 @@ an :class:`HrMessagePlanner`, a :class:`ChatRepository`, and a policy
 dataclass. It never reads environment variables nor talks to FastAPI —
 both responsibilities live in ``module.py``.
 
-SafetyPlane 集成 (ADR-006-v2)
-=============================
+SafetyPlane 集成
+================
 
 三条会产生外部副作用的 dispatch 路径 —— ``_execute_reply`` /
 ``_execute_send_resume`` / ``_execute_card`` —— 都在"真正调 connector"之前先跑
-对应的 policy 函数 (``reply_policy`` / ``send_resume_policy`` /
-``card_policy``). policy 返回:
+对应的 policy 函数. policy 返回:
 
 * ``allow``  → 继续原路径, connector 真发, ``mark_processed`` 照常.
 * ``deny``   → 返回 ``status="denied"`` + ``error``, 不触达 connector,
@@ -30,6 +29,9 @@ SafetyPlane 集成 (ADR-006-v2)
   而非 channel adapter 是因为: patrol 路径没有 IncomingMessage 上下文,
   拿不到 channel/user; Notifier 的 Feishu/企业微信 webhook 在 server 启动
   时就绑定好收件人, 是"后台任务叫醒用户"的唯一稳定通道.
+
+ASK 只用于用户实时事实 / 承诺不足的动作。发简历、换简历卡片等 BOSS 预定义
+求职动作默认 allow,由 planner 和连接器审计保证边界。
 
 三条 policy 自己永远不抛异常 —— policy 函数内部 fail-to-ask; 若 suspend
 落盘失败, service 层保守退化为 deny 并在 error 里写 store 失败原因, 让运
@@ -539,11 +541,12 @@ class JobChatService:
             )
             execution: dict[str, Any] | None = None
             if plan.action == ChatAction.ESCALATE and notify_on_escalate:
-                # ESCALATE 只是 planner 对当前消息的 **分类标签**, 真正的
-                # HITL 升级在 action 要外发时由 SafetyPlane 用 AskRequest
-                # 完成. 这里保留计数 + 审计, 不再走 Notifier 单向广播
-                # (单向广播 ≠ 升级).
                 notify_count += 1
+                execution = self._suspend_escalation(
+                    row=row,
+                    reason=plan.reason,
+                    run_id=trace_id,
+                )
                 logger.info(
                     "job_chat.escalate_tagged conversation=%s company=%s reason=%s",
                     conversation_id,
@@ -845,6 +848,67 @@ class JobChatService:
                     payload_schema="safety.v1.user_answer",
                 ),
             ),
+        )
+
+    def _suspend_escalation(
+        self,
+        *,
+        row: dict[str, Any],
+        reason: str,
+        run_id: str | None,
+    ) -> dict[str, Any] | None:
+        if not self._safety_enforced():
+            return None
+        conversation_id = str(row.get("conversation_id") or "").strip()
+        hr_label = str(row.get("hr_name") or row.get("company") or "HR").strip() or "HR"
+        hr_message = str(row.get("latest_message") or "").strip()
+        intent = Intent(
+            kind="mutation",
+            name="job.chat.escalate",
+            args={
+                "conversation_id": conversation_id,
+                "hr_label": hr_label,
+                "hr_message": hr_message,
+                "profile_id": self._policy.default_profile_id,
+                "conversation_hint": _sanitize_hint(
+                    {
+                        "hr_name": row.get("hr_name"),
+                        "company": row.get("company"),
+                        "job_title": row.get("job_title"),
+                        "latest_hr_message": hr_message,
+                    }
+                ),
+            },
+        )
+        decision = Decision.ask(
+            reason=reason or "job_chat.escalate.requires_user_input",
+            rule_id="job_chat.escalate.ask_user_fact",
+            ask_request=AskRequest(
+                question=(
+                    f"HR {hr_label} 的问题需要你本人确认。\n"
+                    f"HR 刚发: {hr_message}\n"
+                    "请直接回复要发送给 HR 的文本；回 n 则不回复。"
+                ),
+                timeout_seconds=3600,
+                context={
+                    "conversation_id": conversation_id,
+                    "hr_label": hr_label,
+                    "hr_message": hr_message,
+                },
+                resume_handle=ResumeHandle(
+                    task_id=f"job_chat:{conversation_id or 'escalate'}",
+                    module="job_chat",
+                    intent="system.task.resume",
+                    payload_schema="safety.v1.user_answer",
+                ),
+            ),
+        )
+        return self._suspend_and_mark(
+            decision=decision,
+            intent=intent,
+            conversation_id=conversation_id,
+            run_id=run_id,
+            note="safety.ask awaiting user input (escalate)",
         )
 
     def _suspend_and_mark(
@@ -1392,11 +1456,9 @@ class JobChatService:
         if plan.reply_text and plan.reply_text.strip():
             return plan
         if self._replier is None:
-            # 没配 replier, 用 planner 的 heuristic reply 或保守 stall。
             return PlannedChatAction(
-                action=plan.action,
-                reason=plan.reason or "replier unavailable",
-                reply_text=plan.reply_text or "您好，稍后详细回复您。",
+                action=ChatAction.ESCALATE,
+                reason="reply_generator_unavailable",
                 card_type=plan.card_type,
                 card_action=plan.card_action,
             )
@@ -1406,11 +1468,21 @@ class JobChatService:
                 conversation=conversation,
                 snapshot=snapshot,
             )
-        except Exception as exc:  # pragma: no cover
+        except (RuntimeError, ValueError, TypeError) as exc:  # pragma: no cover
             logger.warning("chat replier failed, keep planner output: %s", exc)
-            return plan
+            return PlannedChatAction(
+                action=ChatAction.ESCALATE,
+                reason=f"reply_generator_failed: {exc}",
+                card_type=plan.card_type,
+                card_action=plan.card_action,
+            )
         if not draft.reply_text:
-            return plan
+            return PlannedChatAction(
+                action=ChatAction.ESCALATE,
+                reason=draft.reason or "reply_generator_returned_empty",
+                card_type=plan.card_type,
+                card_action=plan.card_action,
+            )
         new_reason = plan.reason
         if draft.reason:
             new_reason = f"{new_reason}; replier:{draft.reason}" if new_reason else f"replier:{draft.reason}"
@@ -1452,6 +1524,10 @@ class JobChatService:
                 summary="内部错误: job_chat 无法处理非 job_chat 任务。",
                 detail={"task_module": task.module},
             )
+        intent_name = task.original_intent.name
+        if intent_name == "job.chat.escalate":
+            return self._resume_escalation(task, user_answer=user_answer)
+
         verdict = _classify_user_answer(user_answer)
         if verdict == "decline":
             return ResumedExecution(
@@ -1479,7 +1555,6 @@ class JobChatService:
                 },
             )
 
-        intent_name = task.original_intent.name
         if intent_name == "job.chat.reply":
             return self._resume_reply(task)
         if intent_name == "job.chat.send_resume":
@@ -1496,6 +1571,78 @@ class JobChatService:
             ok=False,
             summary="内部错误: 这类任务暂不支持自动重发, 请手动操作。",
             detail={"intent": intent_name},
+        )
+
+    def _resume_escalation(
+        self, task: SuspendedTask, *, user_answer: str
+    ) -> ResumedExecution:
+        args = task.original_intent.args
+        conversation_id = str(args.get("conversation_id") or "").strip()
+        draft_text = str(user_answer or "").strip()
+        verdict = _classify_user_answer(draft_text)
+        if verdict == "decline":
+            return ResumedExecution(
+                status="declined",
+                ok=True,
+                summary="已记录你的拒绝, 本条不会发送给 HR。",
+                detail={"intent": "job.chat.escalate"},
+            )
+        if verdict == "approve" or not draft_text:
+            return ResumedExecution(
+                status="undetermined",
+                ok=False,
+                summary="这条需要你给出具体回复文本, 仅回复 y 不会发送给 HR。",
+                detail={"intent": "job.chat.escalate"},
+            )
+        if not conversation_id:
+            return ResumedExecution(
+                status="failed",
+                ok=False,
+                summary="原始会话 ID 已丢失, 请重新让我拉一次未读。",
+                detail={"reason": "missing conversation_id"},
+            )
+        profile_id = str(args.get("profile_id") or "").strip() or self._policy.default_profile_id
+        hint_raw = args.get("conversation_hint") or {}
+        conversation_hint = dict(hint_raw) if isinstance(hint_raw, Mapping) else {}
+        run_id = datetime.now(timezone.utc).strftime("resume-%Y%m%d%H%M%S")
+        reply_result = self._connector.reply_conversation(
+            conversation_id=conversation_id,
+            reply_text=draft_text,
+            profile_id=profile_id,
+            conversation_hint=conversation_hint,
+        )
+        mark_result = self._connector.mark_processed(
+            conversation_id=conversation_id,
+            run_id=run_id,
+            note="resume.execute action=escalation_reply",
+        )
+        reply_status = str(reply_result.get("status") or "").strip().lower()
+        delivered = (
+            bool(reply_result.get("ok"))
+            and bool(mark_result.get("ok"))
+            and reply_status in _TRUE_DELIVERY_STATUSES
+        )
+        if delivered:
+            return ResumedExecution(
+                status="executed",
+                ok=True,
+                summary="已把你的回复发给 HR。",
+                detail={
+                    "intent": "job.chat.escalate",
+                    "status": reply_status,
+                    "conversation_id": conversation_id,
+                },
+            )
+        return ResumedExecution(
+            status="failed",
+            ok=False,
+            summary="已记录你的回复, 但发送给 HR 时失败, 请稍后手动发一下。",
+            detail={
+                "intent": "job.chat.escalate",
+                "reply_status": reply_status,
+                "reply_error": str(reply_result.get("error") or "")[:300],
+                "mark_error": str(mark_result.get("error") or "")[:300],
+            },
         )
 
     def _resume_reply(self, task: SuspendedTask) -> ResumedExecution:

@@ -166,9 +166,8 @@ class JobChatModule(BaseModule):
         # background task via IM, execution should be real (not preview-only):
         # - auto_execute=True: actually send reply / click resume card
         # - confirm_execute=True: patrol-enable action itself is the HITL gate
-        # This avoids the historical trap where policy defaults
-        # (chat_auto_execute=false + hitl_required=true) made patrol run but
-        # never perform any external action.
+        # This keeps patrol semantics independent from interactive preview
+        # knobs such as chat_auto_execute / hitl_required.
         return self._service.run_process(
             max_conversations=20,
             unread_only=True,
@@ -178,6 +177,46 @@ class JobChatModule(BaseModule):
             auto_execute=True,
             chat_tab="未读",
             confirm_execute=True,
+        )
+
+    def run_pull(
+        self,
+        *,
+        max_conversations: int = 10,
+        unread_only: bool = True,
+        fetch_latest_hr: bool = True,
+        chat_tab: str = "未读",
+    ) -> dict[str, Any]:
+        """Module-level read adapter used by tests/CLI and HTTP intent wiring."""
+        return self._service.run_pull(
+            max_conversations=max_conversations,
+            unread_only=unread_only,
+            fetch_latest_hr=fetch_latest_hr,
+            chat_tab=chat_tab,
+        )
+
+    def run_process(
+        self,
+        *,
+        max_conversations: int = 10,
+        unread_only: bool = True,
+        profile_id: str | None = None,
+        notify_on_escalate: bool = True,
+        fetch_latest_hr: bool = True,
+        auto_execute: bool = False,
+        chat_tab: str = "未读",
+        confirm_execute: bool = False,
+    ) -> dict[str, Any]:
+        """Module-level processing adapter mirroring ``JobChatService``."""
+        return self._service.run_process(
+            max_conversations=max_conversations,
+            unread_only=unread_only,
+            profile_id=profile_id or self._service.policy.default_profile_id,
+            notify_on_escalate=notify_on_escalate,
+            fetch_latest_hr=fetch_latest_hr,
+            auto_execute=auto_execute,
+            chat_tab=chat_tab,
+            confirm_execute=confirm_execute,
         )
 
     # ------------------------------------------------------------------ IntentSpec
@@ -296,8 +335,8 @@ class JobChatModule(BaseModule):
                     "2) 主动发起 (非回复) 招呼 → `job.greet.trigger`; "
                     "3) 仅有一级 HITL 时只返回预览, 不得把预览当作\"已发送\"呈现。"
                     "4) 用户表达\"开启 / 启动 / 打开 / 托管 / 让它持续监听新消息\" "
-                    "→ 走 `system.patrol.enable(name=\"job_chat.patrol\")`, "
-                    "那边默认会立即跑一次 + 继续调度, 不要用本工具代替长程开启。"
+                    "→ 走 `system.patrol.enable(name=\"job_chat.patrol\", trigger_now=false)`, "
+                    "那边只开启长程调度; 用户明确要求\"现在处理一次\"才 trigger_now=true。"
                 ),
                 parameters_schema={
                     "type": "object",

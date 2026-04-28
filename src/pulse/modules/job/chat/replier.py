@@ -25,8 +25,8 @@ whether to auto-send.
 Upstream :class:`HrMessagePlanner` already picked an ``action`` (e.g. ``reply``
 vs ``send_resume``); replier only runs when action == ``reply`` AND the
 planner didn't return a usable ``reply_text``. This keeps the division of
-labor clean — planner = classifier (route=classification), replier =
-generator (route=generation).
+labor clean — planner = classifier, replier = generator, both on route
+``job_chat``.
 
 见 ``docs/Pulse-DomainMemory与Tool模式.md`` §5.1 R4 / §5.2 性能边界。
 """
@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from pulse.core.llm.router import LLMRouter
+from pulse.core.tokenizer import token_preview
 
 from ..memory import JobMemorySnapshot
 
@@ -73,7 +74,7 @@ class ReplyDraft:
 
 
 class HrReplyGenerator:
-    """LLM-backed reply drafter with deterministic fallback."""
+    """LLM-backed reply drafter; invalid LLM output yields no draft."""
 
     def __init__(self, llm_router: LLMRouter) -> None:
         self._llm = llm_router
@@ -104,7 +105,11 @@ class HrReplyGenerator:
         )
         if llm_draft is not None:
             return llm_draft
-        return self._draft_with_heuristic(message=safe_message, max_chars=limit)
+        return ReplyDraft(
+            reply_text="",
+            reason="llm_required_no_heuristic_reply",
+            needs_hitl=True,
+        )
 
     # ──────────────────────────────────────────── LLM path
 
@@ -141,7 +146,7 @@ class HrReplyGenerator:
         )
         user_prompt = (
             f"## Conversation context\n{context_md}\n\n"
-            f"## Latest HR message\n{message[:1200]}\n\n"
+            f"## Latest HR message\n{token_preview(message, max_tokens=800)}\n\n"
             "Return JSON only."
         )
 
@@ -150,7 +155,7 @@ class HrReplyGenerator:
                 _system(system_prompt),
                 _user(user_prompt),
             ],
-            route="generation",
+            route="job_chat",
         )
         if not isinstance(parsed, dict):
             return None
@@ -176,34 +181,6 @@ class HrReplyGenerator:
             reply_text=text,
             tone=tone_out,
             confidence=confidence,
-            needs_hitl=needs_hitl,
-            reason=reason,
-        )
-
-    # ──────────────────────────────────────────── heuristic fallback
-
-    @staticmethod
-    def _draft_with_heuristic(*, message: str, max_chars: int) -> ReplyDraft:
-        """保守降级: 不涉及个性化信息, 给 HITL 方向的 stall 文本。"""
-        lowered = message.lower()
-        if any(tok in lowered for tok in ("简历", "resume", "作品集", "附件")):
-            text = "您好，已收到，我这边马上发送简历。"
-            needs_hitl = False
-            reason = "heuristic: HR asked for resume"
-        elif any(tok in lowered for tok in ("电话", "线下", "薪资", "offer", "面试时间")):
-            text = "您好，这个问题我稍后详细回复您。"
-            needs_hitl = True
-            reason = "heuristic: sensitive topic — needs HITL"
-        else:
-            text = "您好，我已看到消息，稍后回复您。"
-            needs_hitl = True
-            reason = "heuristic: generic stall"
-        if len(text) > max_chars:
-            text = text[:max_chars].rstrip() + "…"
-        return ReplyDraft(
-            reply_text=text,
-            tone="professional",
-            confidence=0.4,
             needs_hitl=needs_hitl,
             reason=reason,
         )
@@ -235,8 +212,11 @@ class HrReplyGenerator:
                 content = str(turn.get("content") or turn.get("text") or "").strip()
                 if not content:
                     continue
-                if len(content) > 200:
-                    content = content[:200] + "…"
+                content = token_preview(
+                    content,
+                    max_tokens=120,
+                    suffix="…",
+                )
                 lines.append(f"    * {speaker}: {content}")
         return "\n".join(lines) or "- (no conversation context)"
 

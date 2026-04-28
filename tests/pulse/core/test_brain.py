@@ -64,6 +64,22 @@ class _FakePlannerLLMRouter:
         return AIMessage(content="任务已完成。")
 
 
+class _CapturingObservationRouter:
+    def __init__(self) -> None:
+        self.seen_messages = []
+
+    def invoke_chat(self, messages, *, tools=None, route="default", tool_choice=None):  # noqa: ANN001, ANN201
+        _ = tools, route, tool_choice
+        self.seen_messages.append(list(messages))
+        tool_calls_seen = sum(1 for message in messages if getattr(message, "tool_call_id", None))
+        if tool_calls_seen <= 0:
+            return AIMessage(
+                content="",
+                tool_calls=[{"name": "debug_big", "args": {}, "id": "call_big"}],
+            )
+        return AIMessage(content="已处理。")
+
+
 def test_brain_runs_explicit_tool_command() -> None:
     registry = ToolRegistry()
     registry.register_callable(_weather)
@@ -166,3 +182,29 @@ def test_brain_reflection_updates_preference_for_followup(tmp_path) -> None:
     result = asyncio.run(brain.run(query="帮我查天气", ctx=TaskContext(), prefer_llm=True))
     assert result.stopped_reason == "completed"
     assert "上海" in result.answer or "shanghai" in result.answer.lower()
+
+
+def test_brain_renders_oversized_tool_observation_as_valid_diagnostic(monkeypatch) -> None:
+    registry = ToolRegistry()
+
+    @tool(name="debug.big", description="returns oversized payload")
+    def _big(_: dict[str, object]) -> dict[str, object]:
+        return {"items": ["x" * 100 for _ in range(20)]}
+
+    registry.register_callable(_big)
+    router = _CapturingObservationRouter()
+    monkeypatch.setattr(Brain, "_MAX_OBSERVATION_TOKENS", 20)
+    brain = Brain(tool_registry=registry, llm_router=router, max_steps=3)
+
+    result = asyncio.run(brain.run(query="run big tool", ctx=TaskContext(), prefer_llm=True))
+
+    assert result.stopped_reason == "completed"
+    second_call_messages = router.seen_messages[-1]
+    tool_contents = [
+        str(getattr(message, "content", ""))
+        for message in second_call_messages
+        if getattr(message, "tool_call_id", None)
+    ]
+    assert tool_contents
+    assert '"_truncated_by": "brain"' in tool_contents[0]
+    assert '"preview"' in tool_contents[0]

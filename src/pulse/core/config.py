@@ -59,6 +59,11 @@ class Settings(BaseSettings):
     core_memory_path: str = Field(default="~/.pulse/core_memory.json")
     memory_recent_limit: int = Field(default=8, ge=1, le=50)
 
+    # ── Patrol lifecycle persistence ──
+    # Durable record of which patrols the user has explicitly enabled/disabled,
+    # rehydrated by AgentRuntime.register_patrol on boot. Reload-safe.
+    patrol_state_path: str = Field(default="~/.pulse/patrol_state.json")
+
     # ── Governance / Evolution ──
     governance_audit_path: str = Field(default="~/.pulse/governance_audit.json")
     governance_rules_versions_path: str = Field(default="~/.pulse/governance_rules_versions.json")

@@ -144,7 +144,13 @@ def test_invoke_structured_fallback_and_schema_parse(monkeypatch) -> None:
 
 def test_vision_route_default_models_are_available() -> None:
     router = LLMRouter()
-    assert router.route_default_pair("vision") == ("gpt-4o-mini", "qwen-vl-max")
+    assert router.route_default_pair("vision") == ("gpt-4o-mini", "qwen-vl-max-latest")
+
+
+def test_job_routes_use_strong_openai_then_stable_qwen_alias() -> None:
+    router = LLMRouter()
+    assert router.route_default_pair("job_match") == ("gpt-4.1", "qwen-max-latest")
+    assert router.route_default_pair("job_chat") == ("gpt-4.1", "qwen-max-latest")
 
 
 def test_invoke_vision_json_sends_multimodal_message_and_parses_json(monkeypatch) -> None:

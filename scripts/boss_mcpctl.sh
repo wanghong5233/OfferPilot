@@ -10,7 +10,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-START_SCRIPT="$SCRIPT_DIR/start_boss_mcp.sh"
+START_SCRIPT="$SCRIPT_DIR/start.sh"
 LOG_FILE="${PULSE_BOSS_MCP_LOG_FILE:-/tmp/pulse_boss_mcp.log}"
 PORT="${PULSE_BOSS_MCP_GATEWAY_PORT:-8811}"
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
@@ -32,7 +32,7 @@ start() {
   fi
 
   echo "[boss_mcp] starting gateway (port=$PORT, log=$LOG_FILE)..."
-  nohup bash "$START_SCRIPT" >"$LOG_FILE" 2>&1 </dev/null &
+  nohup bash "$START_SCRIPT" boss_mcp >"$LOG_FILE" 2>&1 </dev/null &
 
   # gateway 冷启包含 patchright 初始化, 给足窗口
   local i
@@ -101,7 +101,7 @@ usage() {
 Usage: bash $0 <command>
 
 Commands:
-  start        Start BOSS MCP gateway (loads .env via start_boss_mcp.sh)
+  start        Start BOSS MCP gateway (loads .env via start.sh boss_mcp)
   stop         Stop gateway + orphan patchright/chrome children
   restart      Restart gateway
   status       Show process + /health JSON (greet_mode, reply_mode, browser_connected)

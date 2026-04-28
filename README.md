@@ -289,7 +289,7 @@ cp .env.example .env
 # 编辑 .env 填入 OPENAI_API_KEY 或 DASHSCOPE_API_KEY, 以及 DATABASE_URL
 
 pip install -e .[dev]
-pulse start
+./scripts/start.sh all
 ```
 
 API 文档: <http://localhost:8010/docs>
@@ -308,11 +308,11 @@ docker compose up --build
 # 首次登录 BOSS(浏览器扫码,Cookie 自动持久化到 ~/.pulse/boss_browser_profile)
 ./scripts/boss_login.sh
 
-# 在 .env 打开 patrol
-PULSE_JOB_PATROL_GREET_ENABLED=true
-PULSE_JOB_PATROL_CHAT_ENABLED=true
+# 长驻调度开启后, 通过对话或运行时接口启停 patrol
 AGENT_RUNTIME_ENABLED=true
 PULSE_SAFETY_PLANE=enforce
+curl -X POST http://localhost:8010/api/runtime/patrols/job_greet.patrol/enable
+curl -X POST http://localhost:8010/api/runtime/patrols/job_chat.patrol/enable
 ```
 
 ### 连到 Claude Desktop / Cursor(作为 MCP Server)

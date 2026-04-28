@@ -6,9 +6,9 @@
   - taskRun → session:    run 完成或中止后，将 task summary + outcome 压缩为 session summary (P2)
   - session → workspace:  会话结束后压缩为 workspace summary (P2)
 
-CompactionEngine 不直接调用 LLM，而是通过 CompactionStrategy 接口解耦：
-  - LLMCompactionStrategy: 用 LLM 做摘要（质量高，成本高）
-  - RuleCompactionStrategy: 用规则做截断/摘要（零成本，质量一般）
+CompactionEngine 不直接绑定某个 LLM 客户端，而是通过 CompactionStrategy
+接口解耦：默认 RuleCompactionStrategy 生成 token-bounded breadcrumb；
+高质量语义摘要可通过注入 LLM-backed strategy 替换。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from .task_context import TaskContext
+from .tokenizer import count_tokens, token_preview
 from .memory.envelope import (
     MemoryEnvelope,
     MemoryKind,
@@ -66,14 +67,23 @@ class RuleCompactionStrategy:
     """基于规则的压缩策略 — 零 LLM 成本。
 
     策略:
-      1. 保留每个 step 的 tool_name + 截断后的 observation
-      2. 保留最终 answer
+      1. 保留每个 step 的 tool_name + token-bounded observation preview
+      2. 保留最终 answer preview
       3. 如果有 existing_summary，追加新内容
     """
 
-    def __init__(self, *, max_obs_chars: int = 120, max_steps: int = 20) -> None:
-        self._max_obs_chars = max_obs_chars
+    def __init__(
+        self,
+        *,
+        max_obs_tokens: int = 120,
+        max_answer_tokens: int = 200,
+        max_steps: int = 20,
+        tokenizer_model: str = "gpt-4o-mini",
+    ) -> None:
+        self._max_obs_tokens = max(16, int(max_obs_tokens))
+        self._max_answer_tokens = max(16, int(max_answer_tokens))
         self._max_steps = max_steps
+        self._tokenizer_model = tokenizer_model
 
     def compact(self, inp: CompactionInput) -> CompactionOutput:
         t0 = time.monotonic()
@@ -85,20 +95,27 @@ class RuleCompactionStrategy:
         for step in inp.raw_steps[-self._max_steps:]:
             tool = step.get("tool_name", "")
             obs = str(step.get("observation", ""))
-            if len(obs) > self._max_obs_chars:
-                obs = obs[:self._max_obs_chars] + "..."
+            obs = token_preview(
+                obs,
+                max_tokens=self._max_obs_tokens,
+                model=self._tokenizer_model,
+            )
             action = step.get("action", "")
             if tool:
                 lines.append(f"- {tool}: {obs}")
             elif action == "respond":
-                answer = str(step.get("answer", ""))[:200]
+                answer = token_preview(
+                    str(step.get("answer", "")),
+                    max_tokens=self._max_answer_tokens,
+                    model=self._tokenizer_model,
+                )
                 lines.append(f"- [answer] {answer}")
 
         summary = "\n".join(lines) if lines else "(no steps)"
         elapsed = int((time.monotonic() - t0) * 1000)
         return CompactionOutput(
             summary=summary,
-            token_estimate=len(summary) // 3,
+            token_estimate=count_tokens(summary, model=self._tokenizer_model),
             level=inp.level,
             elapsed_ms=elapsed,
         )

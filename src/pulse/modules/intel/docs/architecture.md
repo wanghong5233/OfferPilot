@@ -38,7 +38,7 @@ flowchart LR
 | fetch | `TopicConfig` | `list[SourceFetchResult]` | 单 source 失败不阻塞;每 source 内部限 `max_results` |
 | dedup | `list[RawItem]` + 已存 canonical 集合 | `(list[RawItem], list[canonical_url])` | 输出列表与 canonical 列表 1:1 对齐 |
 | score | `list[RawItem]` + topic | `list[ScoredItem]` | 评分失败 → `score=0`,带 `_error` 入 breakdown |
-| summarize | `list[ScoredItem]`(已过 threshold) | `list[SummarizedItem]` | LLM 失败回退到 `content_raw[:240]`,不产空摘要 |
+| summarize | `list[ScoredItem]`(已过 threshold) | `list[SummarizedItem]` | LLM 失败回退到 token-bounded `content_raw` preview,不产空摘要 |
 | diversify | `list[SummarizedItem]` + topic.diversity | reordered `list[SummarizedItem]` | 单 source ≤ `max_per_source`;contrarian 不被挤出 |
 | serendipity 注入 | orchestrator 查 `IntelDocumentStore.serendipity_pool` | `list[dict]` 跨主题高分行 | 数量 ≤ `topic.diversity.serendipity_slots`;只注入 publish 文本,不重新落库 |
 | publish | `list[SummarizedItem]` + canonical_urls (+ serendipity + archival_memory?) | `DigestPublishResult` | 写库 (canonical UNIQUE) → notifier;高分条目 add_fact 到 `facts`;`dry_run=True` 时只写库不推送也不晋升 |
@@ -98,7 +98,7 @@ flowchart LR
 | 阶段 | 路由 | 方法 | 失败行为 |
 |---|---|---|---|
 | score | `classification` | `invoke_json` | 返回 `None` → `score=0`,breakdown 标 `_error`,不进入 publish 阈值 |
-| summarize | `generation` | `invoke_text` | 抛异常 → 回退 `content_raw[:240]`,数字段不为空 |
+| summarize | `generation` | `invoke_text` | 抛异常 → 回退 token-bounded `content_raw` preview,数字段不为空 |
 
 不在 pipeline 控制流里做 LLM judge / planner。score 与 summarize 都是单 item per call,以失败粒度换 prompt 简单度;批量化推迟到 token 成本变敏感时。
 

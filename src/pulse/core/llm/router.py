@@ -35,6 +35,7 @@ from langchain_openai import ChatOpenAI
 
 from ..event_types import EventTypes, make_payload
 from ..logging_config import get_trace_id
+from ..tokenizer import model_input_budget
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +64,10 @@ ClientFactory = Callable[[str, str, str], Any]
 #
 # 设计原则(2026-04 重新校准):
 #   - OpenAI 系列优先 (用户显式声明): tool-use / 指令遵循 / structured output
-#     三项 Qwen 系中只有 qwen3-max 能追平, qwen-plus 不够强.
-#   - fallback 统一到 qwen3-max: 国内网络 / OpenAI 不可用时, 至少是同档次模型,
-#     而不是 qwen-plus 这种中档.
-#   - cheap/classification: 用 gpt-4o-mini (便宜稳定) 或 qwen-turbo (便宜更便宜)
+#     三项都需要强模型兜底.
+#   - fallback 统一到 qwen-max-latest: DashScope 的稳定别名会指向当前 Max
+#     档模型, 避免业务代码绑定具体快照名.
+#   - cheap/classification: 用 mini / turbo 档控制非关键路径成本.
 #
 # 覆盖优先级 (见 ``candidate_models``):
 #   1. MODEL_ROUTE_<ROUTE>_PRIMARY / _FALLBACK (按 route 精细覆盖)
@@ -74,12 +75,14 @@ ClientFactory = Callable[[str, str, str], Any]
 #   3. 本字典的 (primary, fallback) — 最后的代码保底
 # ─────────────────────────────────────────────────────────────────────
 DEFAULT_ROUTE_MODELS: RouteDefaults = {
-    "default":        ("gpt-4.1",      "qwen3-max"),
-    "planning":       ("gpt-4.1",      "qwen3-max"),
-    "generation":     ("gpt-4o-mini",  "qwen-plus"),
-    "classification": ("gpt-4o-mini",  "qwen-turbo"),
-    "vision":         ("gpt-4o-mini",  "qwen-vl-max"),
-    "cheap":          ("gpt-4o-mini",  "qwen-turbo"),
+    "default":        ("gpt-4.1",      "qwen-max-latest"),
+    "planning":       ("gpt-4.1",      "qwen-max-latest"),
+    "generation":     ("gpt-4o-mini",  "qwen-plus-latest"),
+    "classification": ("gpt-4o-mini",  "qwen-turbo-latest"),
+    "job_match":      ("gpt-4.1",      "qwen-max-latest"),
+    "job_chat":       ("gpt-4.1",      "qwen-max-latest"),
+    "vision":         ("gpt-4o-mini",  "qwen-vl-max-latest"),
+    "cheap":          ("gpt-4o-mini",  "qwen-turbo-latest"),
 }
 
 
@@ -139,6 +142,20 @@ class LLMRouter:
 
     def route_default_pair(self, route: str) -> tuple[str, str]:
         return self._route_defaults.get(route, self._route_defaults["default"])
+
+    def primary_model(self, route: str = "default") -> str:
+        """Return the first candidate model for a route.
+
+        This is the single model-selection entry point for infrastructure that
+        needs model metadata (tokenizer family / input budget). Callers should
+        not reimplement candidate ordering.
+        """
+        candidates = self.candidate_models(route)
+        return candidates[0] if candidates else self._route_defaults["default"][0]
+
+    def input_token_budget(self, route: str = "default") -> int:
+        """Conservative input-token budget for the route's primary model."""
+        return model_input_budget(self.primary_model(route))
 
     def candidate_models(self, route: str = "default") -> list[str]:
         """返回按**路由意图优先**排序的候选模型列表.
@@ -534,8 +551,8 @@ class LLMRouter:
         """便利方法: 调用 LLM 并把结果解析为 JSON 对象。
 
         流程: ``invoke_text`` → ``strip_code_fence`` → ``json.loads``; 任何
-        步骤失败都返回 ``default`` (默认 ``None``), 由调用方决定降级策略
-        (通常是 heuristic fallback)。**不抛异常**, 这是它和 ``invoke_text``
+        步骤失败都返回 ``default`` (默认 ``None``), 由调用方决定降级策略。
+        **不抛异常**, 这是它和 ``invoke_text``
         的主要区别 — 业务层很少需要区分 "LLM 宕机" vs "LLM 返回乱码"。
 
         想要严格的 schema 校验请直接用 :meth:`invoke_structured`。

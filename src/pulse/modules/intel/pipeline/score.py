@@ -19,6 +19,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
+from pulse.core.tokenizer import token_preview
+
 from ..sources import RawItem
 from ..topics import TopicConfig
 
@@ -80,10 +82,10 @@ def _build_prompt(*, topic: TopicConfig, item: RawItem) -> str:
         "  - is_contrarian: boolean, true if the article challenges the "
         "  prevailing narrative on this topic\n\n"
         f"Rubric:\n{rubric}\n\n"
-        f"Title: {item.title[:300]}\n"
+        f"Title: {token_preview(item.title, max_tokens=120)}\n"
         f"URL: {item.url}\n"
         f"Source: {item.source_id}\n"
-        f"Body: {item.content_raw[:1500]}\n"
+        f"Body: {token_preview(item.content_raw, max_tokens=900)}\n"
     )
 
 

@@ -101,20 +101,10 @@ class TestReplyPolicy:
         args.update(over)
         return Intent(kind="mutation", name="job.chat.reply", args=args)
 
-    def test_no_approval_no_evidence_defaults_to_ask(self) -> None:
+    def test_no_approval_no_evidence_allows_planner_reply(self) -> None:
         decision = reply_policy(self._intent(), _ctx())
-        assert decision.kind == "ask"
-        assert decision.ask_request is not None
-        # ask 文案里要能看到 HR 的话, 便于用户在 IM 里直接判断.
-        assert "今天下午方便面试吗?" in decision.ask_request.question
-        assert decision.ask_request.draft == "您好,方便,几点?"
-        # ResumeHandle 的 schema/intent 必须和 resume.py / policies.py 的
-        # 对外常量一致, 否则 inbound resume 路径解不了.
-        handle = decision.ask_request.resume_handle
-        assert handle.payload_schema == DEFAULT_RESUME_PAYLOAD_SCHEMA
-        assert handle.intent == DEFAULT_RESUME_INTENT
-        assert handle.task_id == "task-abc"
-        assert handle.module == "job_chat"
+        assert decision.kind == "allow"
+        assert decision.rule_id == "job_chat.reply.planner_allow"
 
     def test_session_approval_for_same_draft_yields_allow(self) -> None:
         ctx = _ctx(session_approvals=frozenset({"reply:conv-1:h123"}))
@@ -123,17 +113,18 @@ class TestReplyPolicy:
         assert decision.rule_id == "job_chat.reply.session_approval"
 
     def test_session_approval_scoped_to_conversation(self) -> None:
-        # token 拼了 conversation_id, 换 conversation 即便 draft_hash 相同
-        # 也不应被放行, 防止"同意回 HR-A 的草稿"被复用到"回 HR-B".
+        # 错误 session token 不应被当作 session_approved, 但 planner 已选择
+        # reply 且未声明 evidence_keys 时仍可走默认 allow。
         ctx = _ctx(session_approvals=frozenset({"reply:conv-OTHER:h123"}))
         decision = reply_policy(self._intent(), ctx)
-        assert decision.kind == "ask"
+        assert decision.kind == "allow"
 
     def test_session_approval_scoped_to_draft_hash(self) -> None:
-        # 同 conversation 但 draft 被 Agent 偷换, hash 变 → 不应复用旧授权.
+        # 错误 draft token 不应命中 session_approved; 默认 allow 来自 planner,
+        # 不是来自旧授权复用。
         ctx = _ctx(session_approvals=frozenset({"reply:conv-1:OLDHASH"}))
         decision = reply_policy(self._intent(draft_hash="NEWHASH"), ctx)
-        assert decision.kind == "ask"
+        assert decision.kind == "allow"
 
     def test_profile_evidence_allows_when_evidence_keys_declared(self) -> None:
         intent = Intent(
@@ -183,11 +174,10 @@ class TestSendResumePolicy:
         args.update(over)
         return Intent(kind="mutation", name="job.chat.send_resume", args=args)
 
-    def test_defaults_to_ask(self) -> None:
+    def test_defaults_to_allow_predefined_resume_action(self) -> None:
         decision = send_resume_policy(self._intent(), _ctx())
-        assert decision.kind == "ask"
-        assert decision.ask_request is not None
-        assert "腾讯-张三" in decision.ask_request.question
+        assert decision.kind == "allow"
+        assert decision.rule_id == "job_chat.send_resume.predefined_allow"
 
     def test_session_approval_scoped_to_hr_id(self) -> None:
         ctx = _ctx(session_approvals=frozenset({"resume:hr-xyz"}))
@@ -198,13 +188,11 @@ class TestSendResumePolicy:
     def test_session_approval_on_different_hr_does_not_leak(self) -> None:
         ctx = _ctx(session_approvals=frozenset({"resume:hr-OTHER"}))
         decision = send_resume_policy(self._intent(), ctx)
-        assert decision.kind == "ask"
+        assert decision.kind == "allow"
 
-    def test_missing_hr_id_does_not_crash_and_asks(self) -> None:
-        # hr_id 空串时 session_approved 分支被跳过, 直接 ask;
-        # 绝不能抛异常把业务流带崩.
+    def test_missing_hr_id_does_not_crash_and_allows(self) -> None:
         decision = send_resume_policy(self._intent(hr_id=""), _ctx())
-        assert decision.kind == "ask"
+        assert decision.kind == "allow"
 
 
 # ── card_policy ────────────────────────────────────────────────────────
@@ -230,6 +218,14 @@ class TestCardPolicy:
         ctx = _ctx(session_approvals=frozenset({"card:interview_invite"}))
         decision = card_policy(self._intent(), ctx)
         assert decision.kind == "ask"
+
+    def test_exchange_resume_card_allows_predefined_action(self) -> None:
+        decision = card_policy(
+            self._intent(card_type="exchange_resume", card_type_human="换简历请求"),
+            _ctx(),
+        )
+        assert decision.kind == "allow"
+        assert decision.rule_id == "job_chat.card.predefined_allow"
 
     def test_ask_content_surfaces_card_type_human_and_title(self) -> None:
         decision = card_policy(self._intent(), _ctx())

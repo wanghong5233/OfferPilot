@@ -39,6 +39,31 @@ load_env() {
 
 # ---------- individual starters ----------
 
+activate_venv_if_exists() {
+  local real_venv
+  real_venv="$(readlink -f "$VENV_DIR" 2>/dev/null || echo "$VENV_DIR")"
+
+  if [[ -x "$real_venv/bin/python3" ]]; then
+    PY_BIN="$real_venv/bin/python3"
+    export VIRTUAL_ENV="$real_venv"
+    export PATH="$real_venv/bin:$PATH"
+  elif [[ -x "$real_venv/bin/python" ]]; then
+    PY_BIN="$real_venv/bin/python"
+    export VIRTUAL_ENV="$real_venv"
+    export PATH="$real_venv/bin:$PATH"
+  elif command -v python3 >/dev/null 2>&1; then
+    PY_BIN="python3"
+  fi
+}
+
+prepare_python_runtime() {
+  load_env
+  VENV_DIR="${PULSE_VENV_DIR:-$PROJECT_DIR/.venv}"
+  PY_BIN="${PULSE_PYTHON_BIN:-python}"
+  activate_venv_if_exists
+  export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+}
+
 start_pg() {
   if command -v pg_ctlcluster >/dev/null 2>&1; then
     echo "[PG] Starting PostgreSQL cluster..."
@@ -49,14 +74,53 @@ start_pg() {
   fi
 }
 
+start_backend_foreground() {
+  local host port
+  prepare_python_runtime
+  host="${PULSE_HOST:-0.0.0.0}"
+  port="${PULSE_PORT:-8010}"
+
+  echo "=== Pulse backend start ==="
+  echo "PULSE_ENVIRONMENT=${PULSE_ENVIRONMENT:-dev}"
+  echo "host=$host port=$port python=$PY_BIN"
+
+  if [[ "${PULSE_ENVIRONMENT:-dev}" == "prod" || "${PULSE_RELOAD:-true}" == "false" ]]; then
+    echo "mode=production (no reload)"
+    exec "$PY_BIN" -m uvicorn pulse.core.server:create_app --factory --host "$host" --port "$port"
+  else
+    echo "mode=development (reload enabled)"
+    exec "$PY_BIN" -m uvicorn pulse.core.server:create_app --factory --host "$host" --port "$port" --reload
+  fi
+}
+
+start_boss_mcp_foreground() {
+  local port
+  prepare_python_runtime
+  port="${PULSE_BOSS_MCP_GATEWAY_PORT:-8811}"
+
+  echo "=== Pulse BOSS MCP gateway start ==="
+  echo "PULSE_ENVIRONMENT=${PULSE_ENVIRONMENT:-dev}"
+  echo "port=$port python=$PY_BIN"
+  echo "PULSE_BOSS_MCP_GREET_MODE=${PULSE_BOSS_MCP_GREET_MODE:-browser (default)}"
+  echo "PULSE_BOSS_MCP_REPLY_MODE=${PULSE_BOSS_MCP_REPLY_MODE:-browser (default)}"
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN; then
+      echo "[FATAL] port $port already in use."
+      echo "        run 'bash scripts/boss_mcpctl.sh status' to inspect."
+      exit 2
+    fi
+  fi
+
+  exec "$PY_BIN" -m pulse.mcp_servers.boss_platform_gateway
+}
+
 run_backend() {
-  load_env
-  bash "$SCRIPT_DIR/start_backend.sh" 2>&1 | while IFS= read -r l; do echo "[BE] $l"; done
+  start_backend_foreground 2>&1 | while IFS= read -r l; do echo "[BE] $l"; done
 }
 
 run_boss_mcp() {
-  load_env
-  bash "$SCRIPT_DIR/start_boss_mcp.sh" 2>&1 | while IFS= read -r l; do echo "[BOSS_MCP] $l"; done
+  start_boss_mcp_foreground 2>&1 | while IFS= read -r l; do echo "[BOSS_MCP] $l"; done
 }
 
 # 清场: 停掉 Pulse 自己管理的 gateway (daemon 或手动前台启的都匹配, 因为
@@ -103,7 +167,7 @@ assert_boss_mcp_port_free() {
   return 1
 }
 
-# 清场: 停掉旧的 Pulse backend (前台 start_backend.sh 遗留 / 上次 Ctrl+C 没
+# 清场: 停掉旧的 Pulse backend (前台 start.sh backend 遗留 / 上次 Ctrl+C 没
 # 清干净). 精确匹配自家 entrypoint `pulse.core.server:create_app`, 不会误杀
 # 任何非 Pulse uvicorn 实例. 对称 `cleanup_stale_boss_mcp` 的语义:
 #   A) 旧 Pulse backend → pkill 清掉, 继续启动
@@ -191,7 +255,7 @@ assert_backend_port_free() {
 http_code() {
   local url="$1"
   local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)"
+  code="$(curl --connect-timeout 2 --max-time 5 -s -o /dev/null -w '%{http_code}' "$url" || true)"
   if [[ -n "$code" ]]; then
     echo "$code"
   else
@@ -269,10 +333,10 @@ case "$ACTION" in
     start_pg
     ;;
   backend)
-    exec bash "$SCRIPT_DIR/start_backend.sh"
+    start_backend_foreground
     ;;
   boss_mcp)
-    exec bash "$SCRIPT_DIR/start_boss_mcp.sh"
+    start_boss_mcp_foreground
     ;;
   all)
     load_env

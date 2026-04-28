@@ -7,12 +7,11 @@ normalized scan item (whatever ``GreetService._normalize_scan_item`` produces)
 
 Design:
 
-  * **LLM 主路径** (route=``classification``): 把 snapshot 渲染的 markdown
-    片段拼进 system prompt, JD 拼进 user prompt, 通过 ``invoke_json`` 拿
+  * **LLM 主路径** (route=``job_match``): 把 snapshot 渲染的 markdown 片段
+    拼进 system prompt, JD 拼进 user prompt, 通过 ``invoke_json`` 拿
     ``{score, verdict, matched_signals, concerns, reason}``。
-  * **Heuristic 降级**: 当 LLM 不可用 / 返回非 JSON / 字段缺失时, 退回到
-    keyword-substring 打分 + 硬性偏好检查 (城市 / 薪资下限)。保证 pipeline
-    在离线/无 key 环境下仍能跑, 分数偏保守。
+  * **无语义兜底**: LLM 不可用 / 返回非 JSON / 字段缺失时返回 ``skip``。
+    自动打招呼的唯一判断依据是 LLM + JobMemory, 不用关键词启发式替代。
 
 verdict 取值与下游行为:
 
@@ -30,16 +29,13 @@ matcher 是否发射 stage 事件由调用方 (service 编排) 决定, matcher �
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from pulse.core.llm.router import LLMRouter
+from pulse.core.tokenizer import token_preview
 
 from ..memory import JobMemorySnapshot
-
-logger = logging.getLogger(__name__)
-
 
 _VERDICTS: frozenset[str] = frozenset({"good", "okay", "poor", "skip"})
 
@@ -65,7 +61,7 @@ class MatchResult:
 
 
 class JobSnapshotMatcher:
-    """LLM-backed fit scorer with a deterministic heuristic fallback."""
+    """LLM-backed fit scorer; invalid LLM output skips the JD."""
 
     def __init__(self, llm_router: LLMRouter) -> None:
         self._llm = llm_router
@@ -91,7 +87,12 @@ class JobSnapshotMatcher:
         llm_result = self._match_with_llm(job=job, snapshot=snapshot, keyword=keyword)
         if llm_result is not None:
             return llm_result
-        return self._match_with_heuristic(job=job, snapshot=snapshot, keyword=keyword)
+        return MatchResult(
+            score=0.0,
+            verdict="skip",
+            concerns=["LLM matcher unavailable or returned invalid JSON"],
+            reason="llm_required_no_heuristic_autosend",
+        )
 
     # ──────────────────────────────────────────────────────── LLM path
 
@@ -138,7 +139,7 @@ class JobSnapshotMatcher:
                 _system(system_prompt),
                 _user(user_prompt),
             ],
-            route="classification",
+            route="job_match",
         )
         if not isinstance(parsed, dict):
             return None
@@ -164,68 +165,6 @@ class JobSnapshotMatcher:
             reason=reason or "llm_classification",
         )
 
-    # ──────────────────────────────────────────────────────── heuristic path
-
-    def _match_with_heuristic(
-        self,
-        *,
-        job: dict[str, Any],
-        snapshot: JobMemorySnapshot | None,
-        keyword: str,
-    ) -> MatchResult:
-        """Substring-based keyword match + hard preference checks.
-
-        降级路径, 打分保守: 最高 75 分, 避免 LLM 失败时误触发高置信动作。
-        """
-        title = str(job.get("title") or "")
-        snippet = str(job.get("snippet") or "")
-        haystack = f"{title}\n{snippet}"
-        lowered = haystack.lower()
-
-        score = 50.0
-        matched: list[str] = []
-        concerns: list[str] = []
-
-        key = (keyword or "").strip().lower()
-        if key and key in lowered:
-            score += 15.0
-            matched.append(f"keyword '{keyword}' in title/snippet")
-        elif key:
-            concerns.append(f"keyword '{keyword}' not found in JD")
-
-        if snapshot is not None:
-            locations = snapshot.hc_preferred_locations()
-            if locations:
-                city_hit = next(
-                    (loc for loc in locations if loc and loc in haystack),
-                    None,
-                )
-                if city_hit:
-                    score += 8.0
-                    matched.append(f"matches preferred_location {city_hit}")
-                else:
-                    concerns.append("preferred_location not confirmed from JD text")
-
-            hit, which = snapshot.find_avoided_target_in(haystack)
-            if hit:
-                return MatchResult(
-                    score=0.0,
-                    verdict="skip",
-                    matched_signals=matched,
-                    concerns=[f"contains avoided target '{which}'"],
-                    reason="heuristic: avoided target",
-                )
-
-        score = max(30.0, min(score, 75.0))
-        verdict = "okay" if score >= 60 else "poor"
-        return MatchResult(
-            score=round(score, 1),
-            verdict=verdict,
-            matched_signals=matched,
-            concerns=concerns,
-            reason="heuristic_fallback",
-        )
-
     # ──────────────────────────────────────────────────────── helpers
 
     @staticmethod
@@ -241,14 +180,17 @@ class JobSnapshotMatcher:
                 detail_json = json.dumps(detail, ensure_ascii=False, indent=2)
             except (TypeError, ValueError):
                 detail_json = str(detail)
-            detail_md = f"\n- detail: |\n{_indent(detail_json[:1500], prefix='    ')}"
+            detail_md = "\n- detail: |\n" + _indent(
+                token_preview(detail_json, max_tokens=700),
+                prefix="    ",
+            )
 
         return (
             f"- title: {title}\n"
             f"- company: {company}\n"
             f"- salary: {salary}\n"
             f"- user_searched_keyword: {keyword or '(none)'}\n"
-            f"- snippet: {snippet[:1200]}"
+            f"- snippet: {token_preview(snippet, max_tokens=600)}"
             f"{detail_md}"
         )
 

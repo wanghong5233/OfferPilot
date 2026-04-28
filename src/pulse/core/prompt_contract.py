@@ -25,15 +25,58 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Protocol
 
 from .task_context import ExecutionMode, TaskContext
 from .memory_reader import IsolatedMemoryReader
+from .tokenizer import DEFAULT_INPUT_BUDGET, count_tokens
 from .tool import ToolSpec
 
 logger = logging.getLogger(__name__)
+
+
+# Section priority for budget-aware drop. Lower number = higher priority;
+# the budget allocator drops the *highest* numbered sections first when
+# the total token count exceeds ``max_input_tokens``. P0 sections never
+# drop — if they alone exceed the budget the build raises (§1.1 暴露优于兜底).
+class SectionPriority(int, Enum):
+    """Drop priority for prompt sections (higher = drop earlier).
+
+    P0 — IDENTITY/TOOLS/OUTPUT_CONTRACT/BOUNDARIES: irreplaceable. Without
+        them the agent loses identity/capabilities/safety frame.
+    P1 — DOMAIN/PROFILE/PREFS/WORKSPACE: necessary for in-task correctness
+        (e.g. JobMemory snapshot drives JD matching). Drop only when no P2/P3
+        candidates remain.
+    P2 — RECENT: nice-to-have continuity, can be windowed.
+    P3 — RECALL/ARCHIVAL: similarity-ranked, lowest signal-to-noise — drop first.
+    """
+
+    IDENTITY = 0
+    TOOLS = 0
+    OUTPUT_CONTRACT = 0
+    BOUNDARIES = 0
+    USER_PROFILE = 1
+    USER_PREFS = 1
+    WORKSPACE = 1
+    DOMAIN_SNAPSHOT = 1
+    RECENT = 2
+    RECALL = 3
+    ARCHIVAL = 3
+
+
+@dataclass(frozen=True)
+class PromptSection:
+    """A typed prompt fragment with drop-priority metadata."""
+
+    name: str
+    text: str
+    priority: SectionPriority
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.text and self.text.strip())
 
 # Domain snapshot provider: 由业务域 (Job / Mail / Health / ...) 注册,
 # Brain 不知道具体 domain, 只负责按顺序调用并把返回的 markdown 追加到 system prompt。
@@ -72,11 +115,17 @@ class MemoryReader(Protocol):
 
 @dataclass(frozen=True)
 class PromptContract:
-    """一次 prompt 组装的产物。"""
+    """一次 prompt 组装的产物 (post-budget)。
+
+    ``sections`` 是经过预算裁剪后**保留**的段落 (按渲染顺序),
+    ``token_estimate`` 是基于真实 tokenizer (tiktoken / heuristic) 的合计.
+    ``dropped_sections`` 记录被 budget 砍掉的段名供调用方观察 (审计 / 告警).
+    """
 
     contract_type: ContractType
     sections: list[str]
     token_estimate: int
+    dropped_sections: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def text(self) -> str:
@@ -85,6 +134,9 @@ class PromptContract:
 
 class PromptContractBuilder:
     """根据 TaskContext 和 Memory 状态组装 prompt。"""
+
+    DEFAULT_MAX_INPUT_TOKENS = DEFAULT_INPUT_BUDGET
+    DEFAULT_TOKENIZER_MODEL = "gpt-4o-mini"
 
     def __init__(
         self,
@@ -97,6 +149,8 @@ class PromptContractBuilder:
         recall_top_k: int = 4,
         recall_min_similarity: float = 0.15,
         domain_snapshot_providers: list[DomainSnapshotProvider] | None = None,
+        max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
+        tokenizer_model: str = DEFAULT_TOKENIZER_MODEL,
     ) -> None:
         # ToolUseContract §4.1 契约 A:
         #   优先使用 ``tool_specs`` 渲染三段式 (description + when_to_use + when_not_to_use);
@@ -106,6 +160,9 @@ class PromptContractBuilder:
         #   ``similarity=0.0`` 的 keyword/time 命中, 这些伪相关会把 prompt 撑肿,
         #   还会误导 LLM 以为"同一问题刚答过". 默认阈值 0.15 保守地过滤掉
         #   纯 fallback 命中, 调用方若需要更严/更松的筛选可以显式覆盖.
+        # ``max_input_tokens`` / ``tokenizer_model``:
+        #   预算治理的两个旋钮. 默认 24k token (qwen-max worst-case 32k 留 8k 给
+        #   completion). Brain 在初始化时按 router 的 primary 模型上修.
         self._memory = memory
         self._tool_specs: list[ToolSpec] = list(tool_specs or [])
         self._tool_names: list[str] = list(tool_names or []) or [s.name for s in self._tool_specs]
@@ -114,6 +171,16 @@ class PromptContractBuilder:
         self._recall_top_k = recall_top_k
         self._recall_min_similarity = max(0.0, float(recall_min_similarity))
         self._domain_providers: list[DomainSnapshotProvider] = list(domain_snapshot_providers or [])
+        self._max_input_tokens = max(1024, int(max_input_tokens))
+        self._tokenizer_model = str(tokenizer_model or self.DEFAULT_TOKENIZER_MODEL)
+
+    @property
+    def max_input_tokens(self) -> int:
+        return self._max_input_tokens
+
+    @property
+    def tokenizer_model(self) -> str:
+        return self._tokenizer_model
 
     def register_domain_snapshot_provider(self, provider: DomainSnapshotProvider) -> None:
         """动态注册一个 domain snapshot provider (构造后补注册)。
@@ -125,12 +192,14 @@ class PromptContractBuilder:
             return
         self._domain_providers.append(provider)
 
-    def _render_domain_snapshots(self, ctx: TaskContext) -> list[str]:
+    def _render_domain_snapshots(
+        self, ctx: TaskContext
+    ) -> list[PromptSection]:
         """按注册顺序调用 providers, 收集非空 section。
 
         任何 provider 抛异常都降级为警告日志, 不阻断 prompt 组装。
         """
-        sections: list[str] = []
+        sections: list[PromptSection] = []
         for provider in self._domain_providers:
             try:
                 raw = provider(ctx)
@@ -138,128 +207,247 @@ class PromptContractBuilder:
                 logger.warning("domain snapshot provider failed: %s", exc)
                 continue
             if isinstance(raw, str) and raw.strip():
-                sections.append(raw.strip())
+                sections.append(
+                    PromptSection(
+                        name=f"domain:{getattr(provider, '__name__', 'provider')}",
+                        text=raw.strip(),
+                        priority=SectionPriority.DOMAIN_SNAPSHOT,
+                    )
+                )
         return sections
 
     def build(self, ctx: TaskContext, query: str = "") -> PromptContract:
         contract_type = _MODE_TO_CONTRACT.get(ctx.mode, ContractType.system)
         ctx.prompt_contract = contract_type.value
 
-        # P2: 根据 ctx 的隔离级别包装 memory reader
         memory: MemoryReader | None = self._memory
         if memory is not None:
             memory = IsolatedMemoryReader(memory, ctx)
 
         method_name = _CONTRACT_METHOD.get(contract_type, "_build_system")
         builder = getattr(self, method_name)
-        sections = builder(ctx, query, memory)
+        raw_sections: list[PromptSection] = [
+            s for s in builder(ctx, query, memory) if not s.is_empty
+        ]
 
-        token_est = sum(len(s) // 3 for s in sections)
-        lens = [len(s) for s in sections]
+        kept, dropped, total_tokens = self._allocate_budget(
+            raw_sections, contract_type
+        )
+
+        section_diag = [
+            (s.name, count_tokens(s.text, model=self._tokenizer_model))
+            for s in raw_sections
+        ]
         logger.info(
             "prompt_assembled contract=%s mode=%s builder=%s memory_attached=%s "
-            "domain_providers=%d sections=%d token_est=%d section_chars=%s "
+            "domain_providers=%d sections_in=%d sections_kept=%d "
+            "tokens_total=%d budget=%d dropped=%s diag=%s "
             "query_chars=%d session_id=%s task_id=%s",
             contract_type.value,
             getattr(ctx.mode, "value", ctx.mode),
             method_name,
             memory is not None,
             len(self._domain_providers),
-            len(sections),
-            token_est,
-            lens,
+            len(raw_sections),
+            len(kept),
+            total_tokens,
+            self._max_input_tokens,
+            list(dropped),
+            section_diag,
             len(query or ""),
             getattr(ctx, "session_id", None),
             getattr(ctx, "task_id", None),
         )
         return PromptContract(
             contract_type=contract_type,
-            sections=sections,
-            token_estimate=token_est,
+            sections=[s.text for s in kept],
+            token_estimate=total_tokens,
+            dropped_sections=dropped,
         )
+
+    # ── Budget allocation ──────────────────────────────────
+
+    def _allocate_budget(
+        self,
+        sections: list[PromptSection],
+        contract_type: ContractType,
+    ) -> tuple[list[PromptSection], tuple[str, ...], int]:
+        """Drop lowest-priority sections until total tokens ≤ budget.
+
+        Strategy:
+          1. Token-count each section with the configured tokenizer.
+          2. If sum ≤ budget → keep all (fast path).
+          3. Else iteratively drop the *highest-priority-number* (lowest
+             importance) section until under budget. Ties broken by *largest*
+             section first (drop the biggest contributor of the lowest tier).
+          4. If after dropping every P2/P3 section we are still over budget,
+             fail loud with a structured ``RuntimeError`` so the caller can
+             see which P0/P1 section is too big — silent truncation here
+             would just make the model dumber without any signal upstream.
+        """
+        budget = self._max_input_tokens
+        sized: list[tuple[PromptSection, int]] = [
+            (s, count_tokens(s.text, model=self._tokenizer_model)) for s in sections
+        ]
+        total = sum(t for _, t in sized)
+        if total <= budget:
+            return [s for s, _ in sized], (), total
+
+        keep: list[tuple[PromptSection, int]] = list(sized)
+        dropped: list[str] = []
+        # Sort drop candidates: highest priority value (=least important) first,
+        # ties → largest token count first (biggest savings per drop).
+        while total > budget:
+            droppable = [
+                (idx, sec, toks)
+                for idx, (sec, toks) in enumerate(keep)
+                if sec.priority.value >= SectionPriority.RECENT.value
+            ]
+            if not droppable:
+                break
+            droppable.sort(key=lambda triple: (-triple[1].priority.value, -triple[2]))
+            idx, sec, toks = droppable[0]
+            dropped.append(sec.name)
+            keep.pop(idx)
+            total -= toks
+            logger.warning(
+                "prompt_budget: dropped section name=%s priority=%d tokens=%d "
+                "remaining_total=%d budget=%d",
+                sec.name, sec.priority.value, toks, total, budget,
+            )
+
+        if total > budget:
+            # P0/P1 alone exceed budget — config error or runaway memory.
+            # §1.1 暴露优于兜底: raise loudly with diagnosis instead of chopping.
+            diag = [(s.name, t) for s, t in keep]
+            raise RuntimeError(
+                f"prompt budget exhausted: contract={contract_type.value} "
+                f"total_tokens={total} budget={budget} "
+                f"already_dropped={dropped} "
+                f"remaining_p0_p1={diag}. "
+                "Fix the offending section (likely tool_specs, domain snapshot, "
+                "or user_prefs) — silent truncation would degrade model quality."
+            )
+        return [s for s, _ in keep], tuple(dropped), total
 
     # ── Contract Builders ──────────────────────────────────
+    #
+    # Each ``_build_*`` returns ``list[PromptSection]`` (with priority tags);
+    # ``build()`` runs budget allocation, drops low-priority sections if
+    # over-budget, and finally serialises to ``list[str]`` on the contract.
 
-    def _build_system(self, ctx: TaskContext, query: str, mem: MemoryReader | None) -> list[str]:
+    def _ps(
+        self,
+        name: str,
+        text: str,
+        priority: SectionPriority,
+    ) -> PromptSection | None:
+        if not (text and text.strip()):
+            return None
+        return PromptSection(name=name, text=text, priority=priority)
+
+    def _build_system(
+        self, ctx: TaskContext, query: str, mem: MemoryReader | None
+    ) -> list[PromptSection]:
         """interactiveTurn: 完整 prompt。"""
-        sections: list[str] = []
-        sections.append(self._section_identity(mem))
-        sections.append(self._section_user_profile(mem))
-        sections.append(self._section_user_prefs(mem))
-        sections.append(self._section_workspace(mem, ctx))
-        sections.extend(self._render_domain_snapshots(ctx))
-        sections.append(self._section_recent_recall(mem, ctx))
-        sections.append(self._section_relevant_recall(mem, query, ctx))
-        sections.append(self._section_archival(mem, query))
-        sections.append(self._section_tools())
-        sections.append(self._section_tool_use_policy())
-        sections.append(self._section_command_conventions())
-        sections.append(self._section_output_contract())
-        sections.append(self._section_boundaries(mem))
-        return [s for s in sections if s]
+        candidates = [
+            self._ps("identity", self._section_identity(mem), SectionPriority.IDENTITY),
+            self._ps("user_profile", self._section_user_profile(mem), SectionPriority.USER_PROFILE),
+            self._ps("user_prefs", self._section_user_prefs(mem), SectionPriority.USER_PREFS),
+            self._ps("workspace", self._section_workspace(mem, ctx), SectionPriority.WORKSPACE),
+            *self._render_domain_snapshots(ctx),
+            self._ps("recent", self._section_recent_recall(mem, ctx), SectionPriority.RECENT),
+            self._ps("recall", self._section_relevant_recall(mem, query, ctx), SectionPriority.RECALL),
+            self._ps("archival", self._section_archival(mem, query), SectionPriority.ARCHIVAL),
+            self._ps("tools", self._section_tools(), SectionPriority.TOOLS),
+            self._ps("tool_use_policy", self._section_tool_use_policy(), SectionPriority.TOOLS),
+            self._ps("command_conventions", self._section_command_conventions(), SectionPriority.TOOLS),
+            self._ps("output_contract", self._section_output_contract(), SectionPriority.OUTPUT_CONTRACT),
+            self._ps("boundaries", self._section_boundaries(mem), SectionPriority.BOUNDARIES),
+        ]
+        return [s for s in candidates if s is not None]
 
-    def _build_heartbeat(self, ctx: TaskContext, query: str, mem: MemoryReader | None) -> list[str]:
+    def _build_heartbeat(
+        self, ctx: TaskContext, query: str, mem: MemoryReader | None
+    ) -> list[PromptSection]:
         """heartbeatTurn: 轻量 prompt，只读 workspace essentials。"""
-        sections: list[str] = []
-        sections.append(
-            "You are Pulse in heartbeat mode. "
-            "Check workspace status, report anomalies, do NOT start heavy reasoning."
-        )
-        sections.append(self._section_identity_brief(mem))
-        sections.append(self._section_workspace(mem, ctx))
-        sections.append(self._section_tools())
-        return [s for s in sections if s]
+        candidates = [
+            self._ps(
+                "heartbeat_intro",
+                "You are Pulse in heartbeat mode. "
+                "Check workspace status, report anomalies, do NOT start heavy reasoning.",
+                SectionPriority.IDENTITY,
+            ),
+            self._ps("identity_brief", self._section_identity_brief(mem), SectionPriority.IDENTITY),
+            self._ps("workspace", self._section_workspace(mem, ctx), SectionPriority.WORKSPACE),
+            self._ps("tools", self._section_tools(), SectionPriority.TOOLS),
+        ]
+        return [s for s in candidates if s is not None]
 
-    def _build_task(self, ctx: TaskContext, query: str, mem: MemoryReader | None) -> list[str]:
+    def _build_task(
+        self, ctx: TaskContext, query: str, mem: MemoryReader | None
+    ) -> list[PromptSection]:
         """detachedScheduledTask / subagentTask: 任务聚焦 prompt。"""
-        sections: list[str] = []
-        sections.append(
+        intro = (
             f"You are Pulse executing a scheduled task.\n"
             f"Task ID: {ctx.task_id}\n"
             f"Execution mode: {ctx.mode.value}\n"
             f"Focus on completing the task objective. Be efficient."
         )
-        sections.append(self._section_identity_brief(mem))
-        sections.extend(self._render_domain_snapshots(ctx))
-        sections.append(self._section_archival(mem, query))
-        sections.append(self._section_tools())
-        sections.append(self._section_output_contract())
-        sections.append(self._section_boundaries(mem))
-        return [s for s in sections if s]
+        candidates = [
+            self._ps("task_intro", intro, SectionPriority.IDENTITY),
+            self._ps("identity_brief", self._section_identity_brief(mem), SectionPriority.IDENTITY),
+            *self._render_domain_snapshots(ctx),
+            self._ps("archival", self._section_archival(mem, query), SectionPriority.ARCHIVAL),
+            self._ps("tools", self._section_tools(), SectionPriority.TOOLS),
+            self._ps("output_contract", self._section_output_contract(), SectionPriority.OUTPUT_CONTRACT),
+            self._ps("boundaries", self._section_boundaries(mem), SectionPriority.BOUNDARIES),
+        ]
+        return [s for s in candidates if s is not None]
 
-    def _build_compact(self, ctx: TaskContext, query: str, mem: MemoryReader | None) -> list[str]:
+    def _build_compact(
+        self, ctx: TaskContext, query: str, mem: MemoryReader | None
+    ) -> list[PromptSection]:
         """compaction 阶段: 指导 LLM 压缩。"""
-        return [
+        text = (
             "You are Pulse's compaction engine.\n"
             "Summarize the following execution trace into a concise task summary.\n"
             "Preserve: task objective, completed steps, pending items, key findings, user corrections.\n"
             "Discard: raw tool observations, intermediate reasoning, redundant context.\n"
             "Output a structured JSON with keys: objective, completed, pending, findings, corrections."
-        ]
+        )
+        return [PromptSection(name="compact_intro", text=text, priority=SectionPriority.IDENTITY)]
 
-    def _build_promotion(self, ctx: TaskContext, query: str, mem: MemoryReader | None) -> list[str]:
+    def _build_promotion(
+        self, ctx: TaskContext, query: str, mem: MemoryReader | None
+    ) -> list[PromptSection]:
         """promotion 阶段: 指导 LLM 提取事实。"""
-        return [
+        text = (
             "You are Pulse's fact extraction engine.\n"
             "From the following conversation/summary, extract stable facts as structured triples.\n"
             "Each fact: {subject, predicate, object, confidence, evidence_ref}.\n"
             "Only extract facts with high confidence (>0.7).\n"
             "Flag conflicts with existing facts if any are provided.\n"
             "Output a JSON array of fact objects."
-        ]
+        )
+        return [PromptSection(name="promotion_intro", text=text, priority=SectionPriority.IDENTITY)]
 
-    def _build_recovery(self, ctx: TaskContext, query: str, mem: MemoryReader | None) -> list[str]:
+    def _build_recovery(
+        self, ctx: TaskContext, query: str, mem: MemoryReader | None
+    ) -> list[PromptSection]:
         """resumedTask: 从 checkpoint 恢复。"""
-        sections: list[str] = []
-        sections.append(
+        intro = (
             f"You are Pulse resuming a previously interrupted task.\n"
             f"Task ID: {ctx.task_id}\n"
             f"Review the checkpoint below, then continue from where it left off."
         )
-        sections.append(self._section_identity_brief(mem))
-        sections.append(self._section_tools())
-        sections.append(self._section_boundaries(mem))
-        return [s for s in sections if s]
+        candidates = [
+            self._ps("recovery_intro", intro, SectionPriority.IDENTITY),
+            self._ps("identity_brief", self._section_identity_brief(mem), SectionPriority.IDENTITY),
+            self._ps("tools", self._section_tools(), SectionPriority.TOOLS),
+            self._ps("boundaries", self._section_boundaries(mem), SectionPriority.BOUNDARIES),
+        ]
+        return [s for s in candidates if s is not None]
 
     # ── Section Helpers ────────────────────────────────────
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-START_SCRIPT="$SCRIPT_DIR/start_backend.sh"
+START_SCRIPT="$SCRIPT_DIR/start.sh"
 LOG_FILE="${PULSE_LOG_FILE:-/tmp/pulse.log}"
 API_BASE="${PULSE_API_BASE:-http://127.0.0.1:8010}"
 
@@ -22,7 +22,7 @@ start() {
   fi
 
   echo "[pulse] starting backend..."
-  nohup bash "$START_SCRIPT" >"$LOG_FILE" 2>&1 </dev/null &
+  nohup bash "$START_SCRIPT" backend >"$LOG_FILE" 2>&1 </dev/null &
   sleep 3
 
   if _is_up; then
@@ -79,7 +79,7 @@ usage() {
 Usage: bash $0 <command>
 
 Commands:
-  start        Start backend (loads .env via start_backend.sh)
+  start        Start backend (loads .env via start.sh backend)
   stop         Stop backend process
   restart      Restart backend
   status       Show process + /health

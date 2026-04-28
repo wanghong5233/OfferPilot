@@ -262,10 +262,31 @@ def _build_service(
 
 
 class TestExecuteReplyAsk:
-    """reply_policy 默认返 ask → 挂起 + mark + notify, 不调 reply_conversation."""
+    """service 看到 Decision.ask → 挂起 + mark + notify, 不调 reply_conversation."""
 
-    def test_ask_path_suspends_marks_and_notifies(self) -> None:
+    def test_ask_path_suspends_marks_and_notifies(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         service, connector, notifier, store = _build_service()
+
+        def _always_ask(*, policy_fn, intent, trace_id) -> Decision:
+            return Decision.ask(
+                reason="test_requires_user_fact",
+                rule_id="job_chat.reply.test_ask",
+                ask_request=AskRequest(
+                    question="HR 腾讯-张三 需要用户确认",
+                    draft="您好,方便,几点?",
+                    timeout_seconds=3600,
+                    resume_handle=ResumeHandle(
+                        task_id="job_chat:conv-1",
+                        module="job_chat",
+                        intent="system.task.resume",
+                        payload_schema="safety.v1.user_answer",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(service, "_run_policy", _always_ask)
 
         result = service._execute_reply(
             conversation_id="conv-1",
@@ -464,7 +485,7 @@ class TestSafetyPlaneOffBypassesPolicy:
 
 
 class TestExecuteSendResumeAsk:
-    def test_ask_path_does_not_send_attachment(self) -> None:
+    def test_predefined_resume_action_sends_attachment(self) -> None:
         service, connector, notifier, store = _build_service()
 
         result = service._execute_send_resume(
@@ -476,12 +497,11 @@ class TestExecuteSendResumeAsk:
             conversation_hint={"hr_name": "腾讯-李四", "hr_id": "hr-xyz"},
         )
 
-        assert result["status"] == "suspended"
-        assert connector.resume_calls == []
+        assert result["status"] == "sent"
+        assert len(connector.resume_calls) == 1
         assert len(connector.mark_calls) == 1
-        assert len(store.created) == 1
-        assert store.created[0].original_intent.name == "job.chat.send_resume"
-        assert len(notifier.messages) == 1
+        assert store.created == []
+        assert notifier.messages == []
 
 
 # ── _execute_card ask 分支 ─────────────────────────────────────────────
@@ -657,8 +677,33 @@ class TestResumedTaskExecutor:
     失败包成 status="failed" 而非抛 Exception.
     """
 
-    def _suspend_reply(self) -> tuple[JobChatService, _FakeConnector, SuspendedTask]:
+    def _force_ask(self, monkeypatch: pytest.MonkeyPatch, service: JobChatService) -> None:
+        def _always_ask(*, policy_fn, intent, trace_id) -> Decision:
+            conversation_id = str(intent.args.get("conversation_id") or "conv")
+            draft = str(intent.args.get("draft_text") or "")
+            return Decision.ask(
+                reason="test_requires_user_confirmation",
+                rule_id="job_chat.test.ask",
+                ask_request=AskRequest(
+                    question="需要用户确认",
+                    draft=draft or None,
+                    timeout_seconds=3600,
+                    resume_handle=ResumeHandle(
+                        task_id=f"job_chat:{conversation_id}",
+                        module="job_chat",
+                        intent="system.task.resume",
+                        payload_schema="safety.v1.user_answer",
+                    ),
+                ),
+            )
+
+        monkeypatch.setattr(service, "_run_policy", _always_ask)
+
+    def _suspend_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[JobChatService, _FakeConnector, SuspendedTask]:
         service, connector, _notifier, store = _build_service()
+        self._force_ask(monkeypatch, service)
         service._execute_reply(
             conversation_id="conv-R",
             reply_text="您好, 明天上午方便。",
@@ -676,8 +721,10 @@ class TestResumedTaskExecutor:
         connector.mark_calls.clear()
         return service, connector, store.created[0]
 
-    def test_approval_reexecutes_reply_and_sends_to_hr(self) -> None:
-        service, connector, task = self._suspend_reply()
+    def test_approval_reexecutes_reply_and_sends_to_hr(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, connector, task = self._suspend_reply(monkeypatch)
         result = service.resumed_task_executor(task=task, user_answer="y")
         assert result.status == "executed"
         assert result.ok is True
@@ -690,8 +737,8 @@ class TestResumedTaskExecutor:
         assert len(connector.mark_calls) == 1
         assert connector.mark_calls[0]["run_id"].startswith("resume-")
 
-    def test_decline_does_not_send(self) -> None:
-        service, connector, task = self._suspend_reply()
+    def test_decline_does_not_send(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        service, connector, task = self._suspend_reply(monkeypatch)
         result = service.resumed_task_executor(task=task, user_answer="n")
         assert result.status == "declined"
         assert result.ok is True
@@ -699,9 +746,11 @@ class TestResumedTaskExecutor:
         assert connector.reply_calls == []
         assert connector.mark_calls == []
 
-    def test_ambiguous_answer_conservatively_does_not_send(self) -> None:
+    def test_ambiguous_answer_conservatively_does_not_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # "又不是 y 又不是 n" 一律保守, 绝不偷偷把 HR 回复发出去.
-        service, connector, task = self._suspend_reply()
+        service, connector, task = self._suspend_reply(monkeypatch)
         result = service.resumed_task_executor(
             task=task, user_answer="嗯...我再想想"
         )
@@ -711,8 +760,37 @@ class TestResumedTaskExecutor:
         # summary 必须解释后续该怎么做 (用户不是被吞答复的).
         assert "不发送" in result.summary or "新草稿" in result.summary
 
-    def test_reexecute_send_resume_uses_preserved_profile_id(self) -> None:
+    def test_escalation_user_text_is_sent_as_reply(self) -> None:
         service, connector, _notifier, store = _build_service()
+        result = service._suspend_escalation(
+            row={
+                "conversation_id": "conv-E",
+                "hr_name": "HR-A",
+                "company": "A",
+                "job_title": "AI 实习",
+                "latest_message": "今天下午方便电话沟通吗?",
+            },
+            reason="requires realtime availability",
+            run_id="run-E",
+        )
+        assert result is not None
+        assert result["status"] == "suspended"
+        task = store.created[0]
+        connector.mark_calls.clear()
+
+        resumed = service.resumed_task_executor(
+            task=task,
+            user_answer="您好，今天下午三点后方便电话沟通。",
+        )
+
+        assert resumed.status == "executed"
+        assert connector.reply_calls[0]["reply_text"] == "您好，今天下午三点后方便电话沟通。"
+
+    def test_reexecute_send_resume_uses_preserved_profile_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        service, connector, _notifier, store = _build_service()
+        self._force_ask(monkeypatch, service)
         service._execute_send_resume(
             conversation_id="conv-S",
             reply_text=None,

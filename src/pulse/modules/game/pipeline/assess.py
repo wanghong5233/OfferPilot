@@ -6,6 +6,7 @@ import json
 import logging
 from typing import Any
 
+from ....core.tokenizer import token_preview
 from ....core.llm.router import LLMRouter
 from .types import RewardAssessment, TaskResult
 
@@ -25,7 +26,7 @@ def assess_reward(
     prompt = (
         "Classify this game reward text as JSON with keys rarity and items. "
         "rarity must be one of common, rare, ssr, limited, special_event.\n"
-        f"Task: {task_result.name}\nReward text: {text}"
+        f"Task: {task_result.name}\nReward text: {token_preview(text, max_tokens=600)}"
     )
     parsed = llm_router.invoke_json(prompt, route=route, default=None)
     if not isinstance(parsed, dict):

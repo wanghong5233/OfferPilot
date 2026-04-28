@@ -17,6 +17,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from pulse.core.tokenizer import token_preview
+
 from ..topics import TopicConfig
 from .score import ScoredItem
 
@@ -59,11 +61,11 @@ class LLMSummarizer:
                 scored.item.url,
                 exc,
             )
-            text = scored.item.content_raw[:240]
+            text = token_preview(scored.item.content_raw, max_tokens=120)
         cleaned = (text or scored.item.content_raw or "").strip()
         if not cleaned:
             cleaned = scored.item.title
-        return SummarizedItem(scored=scored, summary=cleaned[:600])
+        return SummarizedItem(scored=scored, summary=token_preview(cleaned, max_tokens=300))
 
 
 async def summarize_items(
@@ -81,7 +83,7 @@ def _build_prompt(*, topic: TopicConfig, scored: ScoredItem) -> str:
         f"item under the topic '{topic.display_name}'.\n"
         "Return only the summary text, no JSON, no preface.\n"
         "聚焦事实点（数字 / 名称 / 关键结论），不要复述标题。\n\n"
-        f"标题: {scored.item.title[:300]}\n"
-        f"原文摘要: {scored.item.content_raw[:1500]}\n"
+        f"标题: {token_preview(scored.item.title, max_tokens=120)}\n"
+        f"原文摘要: {token_preview(scored.item.content_raw, max_tokens=900)}\n"
         f"URL: {scored.item.url}\n"
     )

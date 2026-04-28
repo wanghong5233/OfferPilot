@@ -20,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from pulse.core.action_report import (
     ACTION_REPORT_KEY,
@@ -29,6 +29,7 @@ from pulse.core.action_report import (
     ActionStatus,
 )
 from pulse.core.notify.notifier import Notification, Notifier
+from pulse.core.tokenizer import token_preview
 
 from .._connectors.base import JobPlatformConnector
 from ..memory import HardConstraints, JobMemory, JobMemorySnapshot
@@ -524,12 +525,27 @@ class JobGreetService:
                 # Trigger's own trace_id takes precedence if caller forced
                 # one, but the reuse is still detectable via audit field.
 
+        snapshot = self._load_snapshot()
+        requested_keyword = str(keyword or "").strip()
+        scan_keyword = (
+            str(reused_scan.get("keyword") or "").strip()
+            if isinstance(reused_scan, dict)
+            else requested_keyword
+        )
+        effective_keywords = self._resolve_trigger_keywords(
+            keyword=scan_keyword,
+            snapshot=snapshot,
+        )
+        effective_keyword = effective_keywords[0]
+
         trace_id = self._emit(
             stage="trigger",
             status="started",
             trace_id=trace_id,
             payload={
-                "keyword": keyword,
+                "keyword": effective_keyword,
+                "keywords": list(effective_keywords),
+                "requested_keyword": requested_keyword,
                 "batch_size": batch_size,
                 "match_threshold": match_threshold,
                 "confirm_execute": confirm_execute,
@@ -549,7 +565,7 @@ class JobGreetService:
                 status="failed",
                 trace_id=trace_id,
                 payload={
-                    "keyword": keyword,
+                    "keyword": effective_keyword,
                     "error": "scan_handle_unknown_or_expired",
                     "scan_handle": scan_handle,
                 },
@@ -559,6 +575,8 @@ class JobGreetService:
                 "ok": False,
                 "error": "scan_handle_unknown_or_expired",
                 "trace_id": trace_id,
+                "keyword": effective_keyword,
+                "requested_keyword": requested_keyword,
                 "needs_confirmation": False,
                 "execution_ready": self._connector.execution_ready,
                 "greeted": 0,
@@ -592,14 +610,13 @@ class JobGreetService:
             else:
                 # scan 侧不再重复应用过滤(F7): trigger 自己按 pref/hc/dedup 三段
                 # 分别 emit 事件, 保持细粒度审计可见性.
-                scan = self.run_scan(
-                    keyword=keyword,
+                scan = self._run_trigger_scan(
+                    keywords=effective_keywords,
                     max_items=30,
                     max_pages=3,
                     job_type=job_type,
                     fetch_detail=fetch_detail,
                     trace_id=trace_id,
-                    apply_filters=False,
                 )
             daily_limit = max(1, int(self._policy.daily_limit))
             greeted_today = self._repository.today_greeted_urls()
@@ -614,11 +631,13 @@ class JobGreetService:
                     stage="trigger",
                     status="failed",
                     trace_id=trace_id,
-                    payload={"keyword": keyword, "error": reason[:500]},
+                    payload={"keyword": effective_keyword, "error": reason[:500]},
                 )
                 return {
                     "ok": False,
                     "trace_id": trace_id,
+                    "keyword": effective_keyword,
+                    "requested_keyword": requested_keyword,
                     "needs_confirmation": False,
                     "execution_ready": False,
                     "greeted": 0,
@@ -648,7 +667,6 @@ class JobGreetService:
             # 内复用一份 (见 JobMemory.snapshot O(N))。F3 把 hard_constraint
             # / dedup 放在 matcher LLM 之前, 显式过滤可硬性判定的条目,
             # 省 per-item LLM 调用且保证业务边界不靠 LLM 判断是否遵守。
-            snapshot = self._load_snapshot()
             errors = list(scan.get("errors") or [])
 
             pipeline = self._apply_filter_pipeline(items, snapshot=snapshot)
@@ -679,7 +697,9 @@ class JobGreetService:
                 },
             )
 
-            scored_items = self._score_items(pipeline.kept, snapshot=snapshot, keyword=keyword)
+            scored_items = self._score_items(
+                pipeline.kept, snapshot=snapshot, keyword=effective_keyword
+            )
 
             matched = [item for item in scored_items if float(item.get("match_score") or 0.0) >= threshold]
             # 按 LLM 打分降序排; 保留稳定顺序作 tie-break (原始 list 顺序)。
@@ -707,6 +727,8 @@ class JobGreetService:
                 result = {
                     "ok": True,
                     "trace_id": trace_id,
+                    "keyword": effective_keyword,
+                    "requested_keyword": requested_keyword,
                     "needs_confirmation": True,
                     "execution_ready": self._connector.execution_ready,
                     "greeted": 0,
@@ -733,7 +755,7 @@ class JobGreetService:
                     status="preview",
                     trace_id=trace_id,
                     payload={
-                        "keyword": keyword,
+                        "keyword": effective_keyword,
                         "selected_total": len(selected),
                         "pages_scanned": pages_scanned,
                         "source": scan.get("source"),
@@ -782,7 +804,9 @@ class JobGreetService:
                     }
                 )
             self._repository.append_greet_logs(details)
-            self._record_application_events(details, run_id=safe_run_id, keyword=keyword)
+            self._record_application_events(
+                details, run_id=safe_run_id, keyword=effective_keyword
+            )
             greeted_count = sum(1 for row in details if row.get("status") == "greeted")
             # ``unavailable`` = executor refused to try (mode_not_configured /
             # manual_required / dry_run) — infrastructure gap, NOT a real
@@ -800,7 +824,7 @@ class JobGreetService:
                     level=notif_level,
                     title="job_greet trigger",
                     content=(
-                        f"keyword={keyword}; greeted={greeted_count}; "
+                        f"keyword={effective_keyword}; greeted={greeted_count}; "
                         f"failed={failed_count}; unavailable={unavailable_count}; "
                         f"threshold={threshold}"
                     ),
@@ -816,6 +840,8 @@ class JobGreetService:
             result = {
                 "ok": True,
                 "trace_id": trace_id,
+                "keyword": effective_keyword,
+                "requested_keyword": requested_keyword,
                 "needs_confirmation": False,
                 "execution_ready": self._connector.execution_ready,
                 "greeted": greeted_count,
@@ -845,7 +871,7 @@ class JobGreetService:
                 stage="trigger",
                 status="failed",
                 trace_id=trace_id,
-                payload={"keyword": keyword, "error": str(exc)[:500]},
+                payload={"keyword": effective_keyword, "error": str(exc)[:500]},
             )
             raise
 
@@ -854,7 +880,7 @@ class JobGreetService:
             status="completed",
             trace_id=trace_id,
             payload={
-                "keyword": keyword,
+                "keyword": effective_keyword,
                 "greeted": int(result["greeted"]),
                 "failed": int(result["failed"]),
                 "skipped": int(result["skipped"]),
@@ -918,6 +944,121 @@ class JobGreetService:
             seen.add(name)
             out.append(name)
         return out
+
+    def _resolve_trigger_keywords(
+        self,
+        *,
+        keyword: str | None,
+        snapshot: JobMemorySnapshot | None,
+    ) -> list[str]:
+        """Resolve search keywords for both interactive and scheduled trigger.
+
+        Interactive calls may pass an explicit role phrase parsed from the
+        current utterance. Patrol calls have no current utterance, so they read
+        durable JobMemory target_roles and scan each active target instead of
+        freezing forever on one env default keyword.
+        """
+        requested = str(keyword or "").strip()
+        default_keyword = str(self._policy.default_keyword or "").strip()
+        target_roles = (
+            list(snapshot.hard_constraints.target_roles)
+            if snapshot is not None
+            else []
+        )
+        if requested and requested != default_keyword:
+            candidates = [requested]
+        elif target_roles:
+            candidates = [str(role or "").strip() for role in target_roles]
+        else:
+            candidates = [requested or default_keyword or "AI Agent 实习"]
+        return _dedupe_nonempty(candidates)
+
+    def _run_trigger_scan(
+        self,
+        *,
+        keywords: list[str],
+        max_items: int,
+        max_pages: int,
+        job_type: str,
+        fetch_detail: bool,
+        trace_id: str | None,
+    ) -> dict[str, Any]:
+        """Scan all currently active target-role keywords for trigger mode."""
+        safe_keywords = _dedupe_nonempty(keywords)
+        if len(safe_keywords) <= 1:
+            keyword = safe_keywords[0] if safe_keywords else self._policy.default_keyword
+            return self.run_scan(
+                keyword=keyword,
+                max_items=max_items,
+                max_pages=max_pages,
+                job_type=job_type,
+                fetch_detail=fetch_detail,
+                trace_id=trace_id,
+                apply_filters=False,
+            )
+
+        target_total = max(1, min(int(max_items), 80))
+        per_keyword = max(1, (target_total + len(safe_keywords) - 1) // len(safe_keywords))
+        merged_items: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        pages_scanned = 0
+        sources: list[str] = []
+        providers: list[str] = []
+
+        for keyword in safe_keywords:
+            scan = self.run_scan(
+                keyword=keyword,
+                max_items=per_keyword,
+                max_pages=max_pages,
+                job_type=job_type,
+                fetch_detail=fetch_detail,
+                trace_id=trace_id,
+                apply_filters=False,
+            )
+            errors.extend(str(err) for err in list(scan.get("errors") or []))
+            pages_scanned = max(pages_scanned, int(scan.get("pages_scanned") or 0))
+            source = str(scan.get("source") or "").strip()
+            provider = str(scan.get("provider") or "").strip()
+            if source and source not in sources:
+                sources.append(source)
+            if provider and provider not in providers:
+                providers.append(provider)
+            for item in list(scan.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                key = (
+                    f"{item.get('job_id') or ''}::{item.get('source_url') or ''}".lower()
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged_items.append(item)
+                if len(merged_items) >= target_total:
+                    break
+            if len(merged_items) >= target_total:
+                break
+
+        return {
+            "trace_id": trace_id,
+            "keyword": safe_keywords[0],
+            "keywords": safe_keywords,
+            "total": len(merged_items),
+            "pages_scanned": max(1, pages_scanned),
+            "screenshot_path": None,
+            "items": merged_items,
+            "source": ",".join(sources) or self._connector.provider_name,
+            "provider": ",".join(providers) or self._connector.provider_name,
+            "execution_ready": self._connector.execution_ready,
+            "errors": errors,
+            "filter_stats": {
+                "pre_filter_total": len(merged_items),
+                "pref_dropped": 0,
+                "hc_dropped": 0,
+                "dedup_dropped": 0,
+            },
+            "filters_applied": False,
+        }
 
     def _scan_cities(
         self,
@@ -1010,21 +1151,20 @@ class JobGreetService:
     ) -> list[dict[str, Any]]:
         """对每条 JD 调 matcher 打分, 结果写回 item 顶层 key, 过滤 verdict=skip。
 
-        matcher 缺失(无 LLM key / 无 engine)时保留每个 item 原有 match_score
-        (来自 ``_score_keyword_match`` 的 keyword-substring heuristic),
-        不丢数据。
+        自动打招呼是真实外部动作, matcher 缺失或失败时不允许用关键词启发式
+        兜底进入发送候选;只跳过并记录审计原因。
         """
         if self._matcher is None:
-            return list(items)
+            logger.warning("greet matcher unavailable; skip all trigger candidates")
+            return []
         out: list[dict[str, Any]] = []
         for row in items:
             try:
                 result: MatchResult = self._matcher.match(
                     job=row, snapshot=snapshot, keyword=keyword
                 )
-            except Exception as exc:  # pragma: no cover
-                logger.warning("greet matcher failed, keep heuristic score: %s", exc)
-                out.append(row)
+            except (RuntimeError, ValueError, TypeError, KeyError) as exc:  # pragma: no cover
+                logger.warning("greet matcher failed; skip candidate job_id=%s err=%s", row.get("job_id"), exc)
                 continue
             if result.verdict == "skip":
                 logger.info(
@@ -1062,7 +1202,7 @@ class JobGreetService:
                     template=template,
                 )
                 return draft.greeting_text
-            except Exception as exc:  # pragma: no cover
+            except (RuntimeError, ValueError, TypeError) as exc:  # pragma: no cover
                 logger.warning("greet greeter failed, fallback to template: %s", exc)
         if template:
             try:
@@ -1397,7 +1537,10 @@ class JobGreetService:
         title_raw = str(row.get("title") or "").strip()
         dedupe_seed = (source_url or title_raw or json.dumps(row, ensure_ascii=False)[:120]).lower()
         title = _guess_title(title_raw, keyword=keyword)
-        snippet = str(row.get("snippet") or row.get("description") or title_raw or "")[:1000]
+        snippet = token_preview(
+            str(row.get("snippet") or row.get("description") or title_raw or ""),
+            max_tokens=700,
+        )
         company_raw = str(row.get("company") or "").strip()
         company = company_raw if company_raw else _guess_company(title_raw, source_url)
         if not source_url:
@@ -1457,23 +1600,27 @@ def _guess_title(raw_title: str, *, keyword: str) -> str:
     return title[:120]
 
 
+_SALARY_DEFAULT_WORK_DAYS_PER_MONTH = 22
+
+
 def _parse_salary_range_k(salary: str) -> tuple[int | None, int | None]:
-    """把 "20-40K" / "15K" / "面议" 这种文本拆成 (floor, ceiling), 单位 K/月。
+    """把常见薪资文本拆成 (floor, ceiling), 单位 K/月。
 
     规则:
       * ``20-40K`` / ``20-40k`` → (20, 40)
       * ``15K``                → (15, 15)
+      * ``200-300元/天``        → (4, 7)  # 22 工作日/月, round 到 K/月
       * ``20-40·15薪``         → (20, 40) — ``·N薪`` 不影响月薪区间
       * 无法识别 (如 ``面议`` / 空) → (None, None)
-      * "元" / "w" / 时薪等非月薪单位一律返回 (None, None), 不乱猜
+      * 时薪等无法稳定换算的单位返回 (None, None), 不乱猜
     """
     text = str(salary or "").strip()
     if not text:
         return None, None
     lowered = text.lower()
-    if ("k" not in lowered) or any(tok in lowered for tok in ("时薪", "日薪", "小时", "面议")):
-        # 没 "K" 单位我们不敢硬猜成月薪; "时薪/日薪" 显然也不能当月薪比
+    if any(tok in lowered for tok in ("时薪", "小时", "面议")):
         return None, None
+    is_daily = any(tok in lowered for tok in ("日薪", "/天", "／天", "每天", "元/天", "元／天"))
     match = re.search(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)", lowered)
     if match:
         try:
@@ -1483,6 +1630,10 @@ def _parse_salary_range_k(salary: str) -> tuple[int | None, int | None]:
             return None, None
         if hi < lo:
             lo, hi = hi, lo
+        if is_daily:
+            return _daily_yuan_to_monthly_k(lo), _daily_yuan_to_monthly_k(hi)
+        if "k" not in lowered:
+            return None, None
         return int(lo), int(hi)
     single = re.search(r"(\d+(?:\.\d+)?)\s*k", lowered)
     if single:
@@ -1491,7 +1642,37 @@ def _parse_salary_range_k(salary: str) -> tuple[int | None, int | None]:
         except ValueError:
             return None, None
         return v, v
+    daily_single = re.search(
+        r"(?:日薪)?\s*(\d+(?:\.\d+)?)\s*(?:元)?\s*(?:/|／)?\s*(?:天|日)?",
+        lowered,
+    ) if is_daily else None
+    if daily_single:
+        try:
+            v = float(daily_single.group(1))
+        except ValueError:
+            return None, None
+        monthly_k = _daily_yuan_to_monthly_k(v)
+        return monthly_k, monthly_k
     return None, None
+
+
+def _daily_yuan_to_monthly_k(amount_yuan: float) -> int:
+    return max(
+        1,
+        int(round(float(amount_yuan) * _SALARY_DEFAULT_WORK_DAYS_PER_MONTH / 1000.0)),
+    )
+
+
+def _dedupe_nonempty(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
 
 
 def _detect_city_structured(detail: dict[str, Any] | None) -> str | None:

@@ -128,12 +128,9 @@ docs/
 ## 快速启动
 
 ```bash
-export DATABASE_URL="postgresql://user:pass@localhost:5432/pulse"
-export PULSE_MODEL_API_KEY="sk-xxx"
-
-python -m pulse start
-# 或
-uvicorn pulse.core.server:create_app --factory --host 0.0.0.0 --port 8000
+cp .env.example .env
+# 编辑 .env 填入 DATABASE_URL 与模型 API Key
+./scripts/start.sh all
 ```
 
 详细环境配置见仓库根 `.env.example`。

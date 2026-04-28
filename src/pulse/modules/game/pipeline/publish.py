@@ -7,6 +7,7 @@ import logging
 from ....core.llm.router import LLMRouter
 from ....core.memory.archival_memory import ArchivalMemory
 from ....core.notify.notifier import Notification, Notifier
+from ....core.tokenizer import token_preview
 from ..games import GameConfig
 from ..store import GameRunRecord, GameRunStore
 from .types import GameRunResult, RewardAssessment
@@ -66,10 +67,14 @@ def _build_summary(*, llm_router: LLMRouter, result: GameRunResult) -> str:
     total = len(result.tasks)
     succeeded = sum(1 for task in result.tasks if task.succeeded)
     fallback = f"{result.game_id}: 完成 {succeeded}/{total} 个任务,status={result.status}"
+    tasks_preview = token_preview(
+        str([task.to_dict() for task in result.tasks]),
+        max_tokens=900,
+    )
     prompt = (
         "用一句简短中文总结这次游戏日常自动化结果,不要夸张,不要输出 Markdown。\n"
         f"game_id={result.game_id}\nstatus={result.status}\n"
-        f"tasks={[task.to_dict() for task in result.tasks]}"
+        f"tasks={tasks_preview}"
     )
     try:
         text = llm_router.invoke_text(prompt, route="generation").strip()

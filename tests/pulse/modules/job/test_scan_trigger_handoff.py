@@ -37,6 +37,7 @@ import pytest
 
 from pulse.core.memory.workspace_memory import WorkspaceMemory
 from pulse.modules.job._connectors.base import JobPlatformConnector
+from pulse.modules.job.greet.matcher import MatchResult
 from pulse.modules.job.greet.repository import GreetRepository
 from pulse.modules.job.greet.service import GreetPolicy, JobGreetService
 from pulse.modules.job.memory import JobMemory
@@ -85,7 +86,7 @@ def _build_service(
         notifier=MagicMock(),
         emit_stage_event=MagicMock(return_value="tr_handoff"),
         preferences=preferences,
-        matcher=None,
+        matcher=_PassMatcher(),
         greeter=None,
     )
 
@@ -104,6 +105,18 @@ def _fake_items(n: int, *, city: str | None = None) -> list[dict[str, Any]]:
         }
         for i in range(n)
     ]
+
+
+class _PassMatcher:
+    def match(
+        self,
+        *,
+        job: dict[str, Any],
+        snapshot: object | None,
+        keyword: str = "",
+    ) -> MatchResult:
+        _ = job, snapshot, keyword
+        return MatchResult(score=100.0, verdict="good", reason="test_match")
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +401,7 @@ def test_run_trigger_classifies_mode_not_configured_as_unavailable(
         notifier=notifier,
         emit_stage_event=MagicMock(return_value="tr_unavail"),
         preferences=job_memory,
-        matcher=None,
+        matcher=_PassMatcher(),
         greeter=None,
     )
 
@@ -441,7 +454,7 @@ def test_run_trigger_extract_facts_trigger_includes_unavailable(
         notifier=MagicMock(),
         emit_stage_event=MagicMock(return_value="tr_unavail2"),
         preferences=job_memory,
-        matcher=None,
+        matcher=_PassMatcher(),
         greeter=None,
     )
     observation = service.run_trigger(

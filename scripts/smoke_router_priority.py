@@ -27,7 +27,7 @@ def test_default_no_env() -> None:
     r = LLMRouter()
     cands = r.candidate_models("planning")
     assert cands[0] == "gpt-4.1", f"expected gpt-4.1 first, got {cands}"
-    assert "qwen3-max" in cands, f"qwen3-max missing: {cands}"
+    assert "qwen-max-latest" in cands, f"qwen-max-latest missing: {cands}"
     print("  [ok] no-env planning ->", cands[:3])
 
 
@@ -36,7 +36,7 @@ def test_global_env_does_not_override_route_default() -> None:
 
     planning 路由代码默认 gpt-4.1 → 即使 MODEL_PRIMARY=gpt-4o-mini
     (用户想让便宜模型当兜底), 也不应替换 planning 的强模型诉求.
-    gpt-4o-mini 应该作为全局兜底出现在 gpt-4.1/qwen3-max 之后.
+    gpt-4o-mini 应该作为全局兜底出现在 gpt-4.1/qwen-max-latest 之后.
     """
     _clean_env()
     os.environ["MODEL_PRIMARY"] = "gpt-4o-mini"
@@ -62,7 +62,7 @@ def test_global_env_does_not_override_route_default() -> None:
 def test_global_env_fills_in_default_route() -> None:
     """'default' 路由本身没有强烈诉求, 全局 env 应该生效.
 
-    DEFAULT_ROUTE_MODELS['default'] = (gpt-4.1, qwen3-max), 这里写了
+    DEFAULT_ROUTE_MODELS['default'] = (gpt-4.1, qwen-max-latest), 这里写了
     就不再被全局 env 覆盖 → 和 planning 行为一致.
     这个 case 保持与 planning 一致即可 (不再允许 global 覆盖路由特化默认).
     """

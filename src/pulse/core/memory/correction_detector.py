@@ -4,6 +4,8 @@ import json
 import logging
 from typing import Any
 
+from ..tokenizer import token_preview
+
 logger = logging.getLogger(__name__)
 
 
@@ -89,7 +91,7 @@ class CorrectionDetector:
                 self._dpo_collector.add_pair(
                     prompt=safe_user,
                     chosen=safe_user,
-                    rejected=safe_prev[:1000],
+                    rejected=token_preview(safe_prev, max_tokens=500),
                     metadata=dict(metadata or {}),
                 )
             except Exception as exc:
@@ -124,8 +126,8 @@ class CorrectionDetector:
                     "that should be remembered for future interactions.\n"
                     "Return JSON: {\"rule_key\": \"short_snake_case_key\", \"rule_value\": \"description\"}\n"
                     "Return ONLY valid JSON. If no clear rule, return {\"rule_key\": \"\", \"rule_value\": \"\"}.\n\n"
-                    f"User correction: {user_text[:300]}\n"
-                    f"Previous assistant response: {prev_text[:300]}"
+                    f"User correction: {token_preview(user_text, max_tokens=400)}\n"
+                    f"Previous assistant response: {token_preview(prev_text, max_tokens=400)}"
                 )
                 raw = self._llm_router.invoke_text(prompt, route="classification")
                 cleaned = raw.strip()
@@ -142,7 +144,7 @@ class CorrectionDetector:
         if rule is None:
             for sig in ["以后别", "不要", "以后不要", "别再"]:
                 if sig in user_text:
-                    rule = user_text[:200]
+                    rule = token_preview(user_text, max_tokens=120)
                     break
         if rule:
             try:
@@ -164,8 +166,8 @@ class CorrectionDetector:
             "Determine if the user's message is correcting or disagreeing with the assistant's previous response.\n"
             "Return JSON: {\"is_correction\": true/false, \"reason\": \"...\"}\n"
             "Return ONLY valid JSON.\n\n"
-            f"Assistant's previous response: {prev_text[:300]}\n"
-            f"User's new message: {user_text[:300]}"
+            f"Assistant's previous response: {token_preview(prev_text, max_tokens=400)}\n"
+            f"User's new message: {token_preview(user_text, max_tokens=400)}"
         )
         raw = self._llm_router.invoke_text(instruction, route="classification")
         cleaned = raw.strip()
